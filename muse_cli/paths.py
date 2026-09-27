@@ -47,10 +47,13 @@ SEEN_PATH = os.path.join(MUSE_HOME, ".seen_replies")  # reply ids already shown 
 WATCHER_JSON = os.path.join(MUSE_HOME, "watcher.json")
 # Heartbeat older than this counts as a silent watcher (job runs every ~2m).
 WATCHER_STALE_S = 300
+# Remote control: any Muse chat can drop {"op": ...} JSON here and the TUI
+# picks it up (~1s). Session-tagged, local-only.
+TUI_CMD_DIR = os.path.join(MUSE_HOME, "tui-cmd")
 
 ALL_DIRS = [QUEUE_DIR, RESULTS_DIR, SESSIONS_DIR, SKILLS_DIR, SCRIPTS_DIR,
             CANCEL_DIR, APPROVAL_DIR, EXPORTS_DIR,
-            MESSAGES_DIR, REPLIES_DIR, TODOS_DIR]
+            MESSAGES_DIR, REPLIES_DIR, TODOS_DIR, TUI_CMD_DIR]
 
 
 def ensure_dirs() -> None:

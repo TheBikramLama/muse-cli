@@ -27,14 +27,16 @@ from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
-from textual.widgets import Footer, Header, Input, Markdown, Static, TextArea
+from textual.screen import Screen
+from textual.widgets import (Footer, Header, Input, Label, ListItem, ListView,
+                              Markdown, Static, TextArea)
 
 from .bridge import Bridge
 from .config import load_settings, save_settings
 from .paths import (DEFAULT_SESSION, EXPORTS_DIR, INPUT_HISTORY_PATH,
                    MESSAGES_DIR, PAUSED_PATH, REPLIES_DIR, SCRIPTS_DIR,
                    SEEN_PATH, SESSIONS_DIR, SETTINGS_PATH, TODOS_DIR,
-                   WATCHER_JSON, WATCHER_STALE_S,
+                   TUI_CMD_DIR, WATCHER_JSON, WATCHER_STALE_S,
                    ensure_dirs, valid_session)
 from .protocol import cancel, new_id, submit
 from .runner import check_cwd
@@ -43,6 +45,130 @@ from .skills import install_skill, list_skills, read_skill, remove_skill
 
 SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 CHUNK_THROTTLE_S = 0.15
+
+# -- input completion (zsh-style suggestions for / and !) -------------------
+SLASH_COMMANDS = [
+    "/autoapprove", "/cd", "/clear", "/export", "/help", "/quit",
+    "/restart", "/run", "/scripts", "/session", "/sessions", "/settings",
+    "/skill", "/skills", "/todo", "/todos",
+]
+SKILL_SUBCOMMANDS = ["install", "remove", "show"]
+COMP_MAX = 10
+
+
+def _path_candidates(prefix: str, cwd: str) -> list[str]:
+    """Complete prefix as a filesystem path. Directories get a trailing /."""
+    exp = os.path.expanduser(prefix)
+    if not prefix or prefix.endswith("/") or prefix == "~":
+        dir_exp, base, head = exp or cwd, "", prefix
+    else:
+        dir_exp, base = os.path.split(exp)
+        if not dir_exp:
+            dir_exp = cwd
+        head = prefix[:len(prefix) - len(base)] if base else prefix
+    try:
+        entries = sorted(os.listdir(dir_exp or "."))
+    except OSError:
+        return []
+    out: list[str] = []
+    for e in entries:
+        if not e.startswith(base):
+            continue
+        if e.startswith(".") and not base.startswith("."):
+            continue
+        full = os.path.join(dir_exp, e)
+        suffix = "/" if os.path.isdir(full) else ""
+        out.append(head + e + suffix)
+        if len(out) >= 20:
+            break
+    return out
+
+
+def _exe_candidates(prefix: str) -> list[str]:
+    """Complete prefix as a command name from PATH (first ! word)."""
+    if "/" in prefix:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        try:
+            entries = os.listdir(d)
+        except OSError:
+            continue
+        for e in entries:
+            if e.startswith(prefix) and e not in seen:
+                p = os.path.join(d, e)
+                if os.path.isfile(p) and os.access(p, os.X_OK):
+                    seen.add(e)
+                    out.append(e)
+        if len(out) >= 40:
+            break
+    return sorted(out)
+
+
+def complete_token(text: str, cursor: int, history: list[str], cwd: str,
+                   scripts: list[str], sessions: list[str],
+                   todos: list[str], skills: list[str]
+                   ) -> tuple[int, int, list[str]]:
+    """Suggest completions for the token around the cursor.
+
+    Returns (start, end, candidates) where [start:end] is the token to
+    replace. Only / commands and ! shell get suggestions; plain messages
+    (chat text to Muse) return no candidates.
+    """
+    start = cursor
+    while start > 0 and not text[start - 1].isspace():
+        start -= 1
+    end = cursor
+    while end < len(text) and not text[end].isspace():
+        end += 1
+    token = text[start:cursor]
+
+    def _hist(prefix: str) -> list[str]:
+        out: list[str] = []
+        for h in reversed(history):
+            if h.startswith(prefix) and h != text[:cursor] and h not in out:
+                out.append(h)
+            if len(out) >= 8:
+                break
+        return out
+
+    if text.startswith("/"):
+        head = text[:start]
+        parts = head.split()
+        if len(parts) <= 1:
+            # completing the command itself (token includes the leading /)
+            cands = [c for c in SLASH_COMMANDS if c.startswith(token)]
+            return start, end, (cands + _hist(text[:cursor]))[:COMP_MAX]
+        name = parts[0][1:].lower()
+        arg_i = len(parts) - 1
+        if name == "run":
+            cands = [s for s in scripts if s.startswith(token)]
+        elif name == "cd":
+            cands = _path_candidates(token, cwd)
+        elif name == "todo":
+            cands = [(t[:-3] if t.endswith(".md") else t)
+                     for t in todos if t.startswith(token)]
+        elif name == "session":
+            cands = [s for s in sessions if s.startswith(token)]
+        elif name == "skill" and arg_i == 1:
+            cands = [s for s in SKILL_SUBCOMMANDS if s.startswith(token)]
+        elif name == "skill" and arg_i == 2 and parts[1] in ("remove", "show"):
+            cands = [s for s in skills if s.startswith(token)]
+        else:
+            cands = []
+        return start, end, cands[:COMP_MAX]
+    if text.startswith("!"):
+        if start == 0:
+            # first word: the token includes the leading "!" — strip it
+            # before matching PATH commands and history lines
+            word = token[1:]
+            exes = ["!" + e for e in _exe_candidates(word)]
+            h = _hist("!" + word)
+            merged = h + [e for e in exes if e not in h]
+            return start, end, merged[:COMP_MAX]
+        return start, end, _path_candidates(token, cwd)[:COMP_MAX]
+    return start, end, []
 
 SLASH_ALIASES = {"exit": "quit", "q": "quit", "h": "help", "resume": "sessions"}
 
@@ -70,6 +196,7 @@ Slash commands:
                  windows use ./run.sh --session <name>.)
   /export [name]  save this session's finished tasks as markdown
   /clear         remove finished task cards
+  /restart       restart the TUI (picks up new code)
   /help          this help
   /quit          exit
 
@@ -77,6 +204,7 @@ Aliases: /exit = /quit, /q = /quit, /h = /help, /resume = /sessions
 
 Keys (when the input box is not focused — press Esc to leave it):
   j/k move selection between tasks
+  esc esc  stop everything running (failsafe)
   /   jump back to the input box
   c   show/hide the selected task's commands + full output
   x   cancel the selected (or currently running) task
@@ -85,6 +213,8 @@ Keys (when the input box is not focused — press Esc to leave it):
   a   approve the selected task (when awaiting approval)
   d   deny the selected task (when awaiting approval)
   A   toggle auto-approve for approval requests
+  shift+tab  toggle Approval mode / Auto mode
+  t   show/hide the todo sidebar
   y   copy the selected task's detail to the clipboard
   s   save the selected task's detail + output to ~/.muse/exports/
   g   jump to the newest task
@@ -105,7 +235,13 @@ def copy_to_clipboard(text: str) -> bool:
 
 
 class TaskCard(Vertical):
-    """One unit of work."""
+    """One unit of work.
+
+    Compact by design: the card shows a header (status icon, title,
+    elapsed) plus a single live/summary line. Commands and full output
+    stay hidden behind `c` (toggle_detail). Finished summaries carry
+    timestamps so the feed reads as a quiet log.
+    """
 
     def __init__(self, rid: str, task: str, source: str,
                  cmd: list, cwd: str | None,
@@ -122,9 +258,10 @@ class TaskCard(Vertical):
         self.skills = [str(s) for s in (skills or [])]
         self._step_text = ""
         self.t0 = time.time()
+        self.t0_str = time.strftime("%H:%M:%S", time.localtime(self.t0))
         self.done = False
         self.result: dict | None = None
-        self._tail: list[str] = []
+        self._line = ""  # single live line (last chunk or step), not a tail
         self._detail: TextArea | None = None
         # Mounting is async: compose() hasn't run until on_mount fires, so
         # anything touching composed widgets is deferred/guarded via these.
@@ -174,7 +311,7 @@ class TaskCard(Vertical):
         self.icon.remove_class("awaiting")
         self.icon.add_class("running")
         self._step_text = ""
-        self._tail = []
+        self._line = ""
         self.live.update("starting…")
 
     def mark_awaiting(self) -> None:
@@ -204,9 +341,7 @@ class TaskCard(Vertical):
     def _render_live(self) -> None:
         if not self._composed:
             return
-        parts = [self._step_text] if self._step_text else []
-        parts.extend(self._tail)
-        self.live.update("\n".join(parts) if parts else "\u2026")
+        self.live.update(self._step_text or self._line or "\u2026")
 
     def push_chunk(self, line: str) -> None:
         if not self._composed:
@@ -214,8 +349,7 @@ class TaskCard(Vertical):
         line = line.rstrip()
         if not line:
             return
-        self._tail.append(line)
-        self._tail = self._tail[-3:]
+        self._line = line  # compact: only the latest line is shown
         self._render_live()
 
     def tick(self, frame: int) -> None:
@@ -236,8 +370,14 @@ class TaskCard(Vertical):
         self.icon.update("✓" if ok else "✗")
         self.icon.remove_class("running")
         self.icon.add_class("done" if ok else "failed")
-        self.elapsed.update(f"{res.get('duration_s', 0):.1f}s")
-        self.live.update(res.get("summary") or res.get("error") or "done")
+        dur = res.get("duration_s", 0) or 0
+        self.elapsed.update(f"{dur:.1f}s")
+        ended = res.get("ended_at")
+        ts = (time.strftime("%H:%M:%S", time.localtime(ended))
+              if isinstance(ended, (int, float)) else
+              time.strftime("%H:%M:%S", time.localtime()))
+        summary = res.get("summary") or res.get("error") or "done"
+        self.live.update(f"{summary} · {ts} · {dur:.1f}s")
         self._detail = TextArea(self._detail_text(res), read_only=True,
                                 classes="detail")
         self._detail.display = False
@@ -250,8 +390,11 @@ class TaskCard(Vertical):
         self.icon.update("✓" if ok else "✗")
         self.icon.remove_class("running")
         self.icon.add_class("done" if ok else "failed")
-        self.elapsed.update(f"{rec.get('duration_s', 0):.1f}s")
-        self.live.update(rec.get("summary") or "")
+        dur = rec.get("duration_s", 0) or 0
+        self.elapsed.update(f"{dur:.1f}s")
+        summary = rec.get("summary") or ""
+        self.live.update(f"{summary} · {dur:.1f}s · previous session"
+                         if summary else f"{dur:.1f}s · previous session")
         self._detail = TextArea(
             f"$ {' '.join(self.cmd)}\nin {self.cwd} · {self.source} · previous session\n"
             f"summary: {rec.get('summary') or ''}",
@@ -265,9 +408,19 @@ class TaskCard(Vertical):
                 str(s.get("name", "")) for s in self.steps)
         else:
             first = f"$ {' '.join(self.cmd)}"
+        started = res.get("started_at")
+        ended = res.get("ended_at")
+        when = ""
+        if isinstance(started, (int, float)):
+            when = time.strftime("%H:%M:%S", time.localtime(started))
+            if isinstance(ended, (int, float)):
+                when += " → " + time.strftime("%H:%M:%S", time.localtime(ended))
+        elif hasattr(self, "t0_str"):
+            when = self.t0_str
         lines = [
             first,
-            f"in {self.cwd} · {self.source} · {res.get('duration_s', 0):.1f}s",
+            f"in {self.cwd} · {self.source} · {res.get('duration_s', 0):.1f}s"
+            + (f" · {when}" if when else ""),
             f"summary: {res.get('summary') or res.get('error') or ''}",
         ]
         if res.get("steps"):
@@ -384,15 +537,20 @@ class TodoCard(Vertical):
             return False
         if not self._composed:
             self._pending_text = text
+            self.progress_text = self._progress_of(text)
             return True
         self._apply_text(text)
         return True
 
-    def _apply_text(self, text: str) -> None:
+    @staticmethod
+    def _progress_of(text: str) -> str:
         done = len(re.findall(r"^\s*[-*]\s+\[x\]", text, re.M | re.I))
         open_ = len(re.findall(r"^\s*[-*]\s+\[ \]", text, re.M))
         total = done + open_
-        self.progress_text = f"{done}/{total}" if total else "empty"
+        return f"{done}/{total}" if total else "empty"
+
+    def _apply_text(self, text: str) -> None:
+        self.progress_text = self._progress_of(text)
         if self._composed:
             self.progress.update(self.progress_text)
         # Real checkboxes regardless of the markdown renderer's task-list support.
@@ -405,21 +563,125 @@ class TodoCard(Vertical):
                 pass
 
 
+class CmdInput(Input):
+    """The command box, with completion-dropdown key handling.
+
+    Tab/Shift+Tab/Up/Down/Enter/Escape are intercepted here (before the
+    Screen's focus bindings) when the completion dropdown is open; Tab
+    also triggers completion. Everything else bubbles to the app as before.
+    """
+
+    def on_key(self, event: events.Key) -> None:
+        app = self.app
+        if not isinstance(app, MuseCliApp):
+            return
+        key = event.key
+        if key == "tab":
+            if app.completion_accept_or_open():
+                event.prevent_default()
+                event.stop()
+        elif key == "shift+tab":
+            app.action_toggle_auto_approve()
+            event.prevent_default()
+            event.stop()
+        elif app.completion_open:
+            if key == "escape":
+                app.completion_close()
+            elif key == "up":
+                app.completion_move(-1)
+            elif key == "down":
+                app.completion_move(1)
+            elif key == "enter":
+                if not app.completion_accept():
+                    return
+            else:
+                return
+            event.prevent_default()
+            event.stop()
+
+
+class MuseScreen(Screen):
+    """Default screen without tab/shift+tab focus bindings.
+
+    Tab is the completion key and Shift+Tab toggles the approval mode;
+    both are handled by the app instead of moving focus.
+    """
+    BINDINGS = [b for b in Screen.BINDINGS
+                if b.key not in ("tab", "shift+tab")]
+
+
+class TodoRow(Static):
+    """One clickable todo-list row in the sidebar."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__("", classes="todo-row")
+        self.tname = name
+
+    def on_click(self) -> None:
+        app = self.app
+        if isinstance(app, MuseCliApp):
+            app.scroll_to_todo(self.tname)
+
+
 class MuseCliApp(App):
     TITLE = "muse-cli"
     CSS = """
-    #statusbar {
+    #topline {
         dock: top; height: 1;
         background: $surface; color: $text-muted;
         padding: 0 1;
     }
-    #tasks { height: 1fr; }
+    #modeline {
+        dock: top; height: 1;
+        background: $surface; color: $text-muted;
+        padding: 0 1;
+    }
+    #main { height: 1fr; }
+    #tasks { width: 1fr; height: 1fr; }
+    #todoside {
+        width: 34; height: 1fr;
+        border-left: solid $primary-darken-2;
+        background: $surface; padding: 0 1;
+    }
+    #todoside.hidden { display: none; }
+    .todo-side-head { text-style: bold; color: $text-muted; margin-bottom: 1; }
+    .todo-row { height: 1; color: $text; }
+    .todo-row:hover { background: $surface-lighten-1; }
+    #activitybar {
+        height: 1; padding: 0 1;
+        background: $surface-darken-1;
+    }
+    #activity-left { width: 1fr; }
+    #activity-right { width: auto; color: $text-muted; }
     #empty {
         text-align: center;
         color: $text-muted;
         padding: 2 1;
     }
-    #cmd { dock: bottom; margin: 0 1 1 1; }
+    #cmd { margin: 0 1; }
+    #completion {
+        height: auto; max-height: 8; margin: 0 1;
+        border: solid $primary-darken-2;
+        background: $surface; display: none;
+    }
+    #completion.open { display: block; }
+    #completion > ListItem { padding: 0 1; }
+    #cwdline {
+        height: 1; padding: 0 1; color: $text-muted;
+    }
+    #toasts {
+        layer: toasts; dock: top;
+        width: 1fr; height: auto; align: right top;
+    }
+    .toast-holder { width: 1fr; height: auto; align-horizontal: right; }
+    .toast {
+        width: 48; max-width: 60%; height: auto;
+        margin: 1 1 0 0; padding: 0 1;
+        background: $panel-lighten-1;
+        border-left: outer $success;
+    }
+    .toast.-warning { border-left: outer $warning; }
+    .toast.-error { border-left: outer $error; }
     .task-card {
         border: solid $primary-darken-2;
         margin: 0 1 1 1; padding: 0 1;
@@ -460,8 +722,9 @@ class MuseCliApp(App):
         ("x", "cancel_task", "Cancel"),
         ("a", "approve_task", "Approve"),
         ("d", "deny_task", "Deny"),
-        ("A", "toggle_auto_approve", "Auto-approve"),
+        ("shift+tab", "toggle_auto_approve", "Mode"),
         ("p", "toggle_pause", "Pause"),
+        ("t", "toggle_sidebar", "Todos"),
         ("r", "retry_task", "Retry"),
         ("s", "save_output", "Save"),
         ("y", "copy_task", "Copy"),
@@ -498,22 +761,92 @@ class MuseCliApp(App):
         self._watcher: dict | None = None
         self._watcher_mtime = 0.0
         self._msg_cards: dict[str, MessageCard] = {}
+        # Completion dropdown state.
+        self.completion_open = False
+        self._comp_items: list[str] = []
+        self._comp_idx = 0
+        self._comp_start = 0
+        self._comp_end = 0
+        # Todo sidebar: shown when a todo list has open items; `t` toggles
+        # a manual hide override.
+        self._sidebar_manual_hide = False
+        # Double-Esc failsafe: two presses within this window stop everything.
+        self._last_esc = 0.0
+
+    def get_default_screen(self) -> Screen:
+        return MuseScreen()
+
+    # -- top-right toasts (override: never the bottom-right rack) --
+    def notify(self, message: object, *, title: str = "",
+               severity: str = "information", timeout: float = 4) -> None:
+        """Show a toast top-right. Thread-safe; replaces App.notify."""
+        try:
+            self.call_from_thread(self._show_toast, str(message), title,
+                                  severity, timeout)
+        except RuntimeError:
+            if self.is_running:
+                try:
+                    self._show_toast(str(message), title, severity, timeout)
+                except Exception:
+                    pass
+
+    def _show_toast(self, message: str, title: str, severity: str,
+                    timeout: float) -> None:
+        try:
+            holder = self.query_one("#toasts", Vertical)
+        except Exception:
+            return
+        kids = list(holder.children)
+        if len(kids) >= 4:
+            try:
+                kids[0].remove()
+            except Exception:
+                pass
+        text = Text()
+        if title:
+            text.append(title + "\n", style="bold")
+        text.append(message)
+        toast = Static(text, classes=f"toast -{severity}")
+        holder.mount(toast)
+        self.set_timer(timeout, toast.remove)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        self.statusbar = Static("", id="statusbar")
-        yield self.statusbar
-        self.task_list = ScrollableContainer(id="tasks")
-        yield self.task_list
-        yield Input(placeholder="/ command · ! shell · text = message to Muse", id="cmd")
+        self.topline = Static("", id="topline")
+        yield self.topline
+        self.modeline = Static("", id="modeline")
+        yield self.modeline
+        self.toasts = Vertical(id="toasts")
+        yield self.toasts
+        with Horizontal(id="main"):
+            self.task_list = ScrollableContainer(id="tasks")
+            yield self.task_list
+            self.todoside = Vertical(id="todoside")
+            yield self.todoside
+        with Horizontal(id="activitybar"):
+            self.activity_left = Static("", id="activity-left")
+            yield self.activity_left
+            self.activity_right = Static("", id="activity-right")
+            yield self.activity_right
+        self.completion = ListView(id="completion")
+        yield self.completion
+        self.cmd_input = CmdInput(
+            placeholder=("/ command · ! shell · text = message to Muse"
+                         " · tab completes · shift+tab switches mode"),
+            id="cmd")
+        yield self.cmd_input
+        self.cwdline = Static("", id="cwdline")
+        yield self.cwdline
         yield Footer()
 
     def on_mount(self) -> None:
-        self._refresh_statusbar("bridge starting…")
+        self._refresh_statusbar()
         self.empty_state = Static(
             "no tasks yet — /help for commands · ! for shell · plain text messages Muse",
             id="empty")
         self.task_list.mount(self.empty_state)
+        self.todoside.mount(Static("☑ todo lists", classes="todo-side-head"))
+        self._refresh_sidebar()
         for rec in load_recent(self.settings.get("tui", {}).get("history_limit", 50)):
             card = TaskCard(rec.get("id", "?"), rec.get("task", ""),
                             rec.get("source", "muse"), rec.get("cmd", []),
@@ -534,11 +867,11 @@ class MuseCliApp(App):
         self._bridge.start()
         for req in self._bridge.pending_approvals():
             self._on_approval(req)
-        self._refresh_statusbar("bridge online")
+        self._refresh_statusbar()
         self.set_interval(0.1, self._tick)
         self.task_list.scroll_end(animate=False)
         try:
-            self.query_one("#cmd", Input).focus()
+            self.cmd_input.focus()
         except Exception:
             pass
 
@@ -656,10 +989,12 @@ class MuseCliApp(App):
             self._last_active = active
             self._refresh_statusbar()
         self._poll_n += 1
+        self._refresh_activity()
         if self._poll_n % 10 == 0:  # ~1s
             self._poll_replies()
             self._poll_todos()
             self._poll_watcher()
+            self._poll_tui_cmd()
         if self._poll_n % 100 == 0:  # ~10s: staleness is time-based, so the
             self._refresh_statusbar()  # watcher segment needs a periodic nudge
 
@@ -791,6 +1126,7 @@ class MuseCliApp(App):
         for name in list(self._todo_cards):
             if name not in names:
                 self._drop_todo(name)
+        self._refresh_sidebar()
 
     def _drop_todo(self, name: str) -> None:
         card = self._todo_cards.pop(name, None)
@@ -799,6 +1135,150 @@ class MuseCliApp(App):
                 card.remove()
             except Exception:
                 pass
+
+    # -- remote control: ~/.muse/tui-cmd/*.json ------------------------------
+    # Any Muse chat (or script) can drive this TUI window by dropping a
+    # JSON file here. Files are consumed and deleted. The "session" field
+    # routes the op to the right TUI window; other windows ignore it.
+    # Ops: notify{ text }, card{ text }, run{ task, cmd[], cwd?, timeout? },
+    # clear{}, mode{ "auto" | "approval" }, restart{}.
+    def _poll_tui_cmd(self) -> None:
+        try:
+            names = sorted(os.listdir(TUI_CMD_DIR))
+        except OSError:
+            return
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            p = os.path.join(TUI_CMD_DIR, name)
+            try:
+                with open(p) as f:
+                    payload = json.load(f)
+            except (OSError, ValueError):
+                payload = None
+            if not isinstance(payload, dict):
+                # Unreadable junk: remove so a bad file can't wedge the loop.
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+                continue
+            if (payload.get("session") or DEFAULT_SESSION) != self.instance_session:
+                # Another window's command — leave it for that window.
+                continue
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            self._handle_tui_cmd(payload)
+
+    def _handle_tui_cmd(self, p: dict) -> None:
+        if (p.get("session") or DEFAULT_SESSION) != self.instance_session:
+            return  # another window's business
+        op = p.get("op")
+        if op == "notify":
+            self.notify(str(p.get("text", ""))[:300])
+        elif op == "card":
+            text = p.get("text")
+            if isinstance(text, str) and text.strip():
+                card = MessageCard(p.get("id") or new_id(), text,
+                                   incoming=True, at=time.time())
+                self.task_list.mount(card)
+                self.task_list.scroll_end(animate=False)
+                self.notify("💬 card from Muse")
+        elif op == "run":
+            cmd = p.get("cmd")
+            if isinstance(cmd, list) and cmd:
+                task = str(p.get("task") or " ".join(cmd)[:80])
+                rid = submit(task=task, cmd=cmd,
+                             cwd=p.get("cwd") or self.session_cwd,
+                             timeout=p.get("timeout") or 120,
+                             source="muse", session=self.instance_session)
+                card = TaskCard(rid, task, "muse", cmd, self.session_cwd)
+                self.cards[rid] = card
+                self.focused_rid = rid
+                self.task_list.mount(card)
+                self.task_list.scroll_end(animate=False)
+                self.refresh_selection()
+        elif op == "clear":
+            for rid, card in list(self.cards.items()):
+                if card.done:
+                    card.remove()
+                    del self.cards[rid]
+            self.focused_rid = None
+            self.refresh_selection()
+        elif op == "mode":
+            mode = p.get("mode")
+            if mode == "auto":
+                self._set_auto_approve(True)
+            elif mode == "approval":
+                self._set_auto_approve(False)
+        elif op == "restart":
+            self._restart_self()
+
+    # -- todo sidebar -------------------------------------------------------
+    def _todo_counts(self) -> tuple[int, int]:
+        """(done, total) summed across todo lists."""
+        done = total = 0
+        for card in self._todo_cards.values():
+            m = re.match(r"(\d+)/(\d+)$", card.progress_text)
+            if m:
+                done += int(m.group(1))
+                total += int(m.group(2))
+        return done, total
+
+    def _has_active_todos(self) -> bool:
+        done, total = self._todo_counts()
+        return total > 0 and done < total
+
+    def _refresh_sidebar(self) -> None:
+        try:
+            side = self.todoside
+        except AttributeError:
+            return
+        for row in list(side.query(TodoRow)):
+            try:
+                row.remove()
+            except Exception:
+                pass
+        for name in sorted(self._todo_cards):
+            card = self._todo_cards[name]
+            row = TodoRow(name)
+            row.update(self._todo_row_text(name, card.progress_text))
+            side.mount(row)
+        visible = self._has_active_todos() and not self._sidebar_manual_hide
+        try:
+            side.set_class(not visible, "hidden")
+        except Exception:
+            pass
+        self._refresh_activity()
+
+    def _todo_row_text(self, name: str, progress: str) -> Text:
+        t = Text()
+        short = name[:-3] if name.endswith(".md") else name
+        m = re.match(r"(\d+)/(\d+)$", progress)
+        t.append(short[:18].ljust(18) + " ")
+        if m:
+            done, total = int(m.group(1)), int(m.group(2))
+            fill = round(8 * done / total) if total else 0
+            bar = "▓" * fill + "░" * (8 - fill)
+            t.append(bar, style="green" if done == total else "yellow")
+            t.append(f" {done}/{total}", style="dim")
+        else:
+            t.append("—", style="dim")
+        return t
+
+    def scroll_to_todo(self, name: str) -> None:
+        card = self._todo_cards.get(name)
+        if card is not None:
+            try:
+                card.scroll_visible()
+            except Exception:
+                pass
+
+    def action_toggle_sidebar(self) -> None:
+        self._sidebar_manual_hide = not self._sidebar_manual_hide
+        self._refresh_sidebar()
 
     def _list_todos(self) -> None:
         if not self._todo_cards:
@@ -902,6 +1382,7 @@ class MuseCliApp(App):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
         event.input.value = ""
+        self.completion_close()
         if not text:
             return
         self._hist_push(text)
@@ -912,6 +1393,121 @@ class MuseCliApp(App):
             self._shell(text[1:].strip())
             return
         self._send_message(text)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # Refilter the open dropdown as the user types.
+        if not self.completion_open or event.input.id != "cmd":
+            return
+        start, end, cands = self._completion_data()
+        token = event.value[start:event.input.cursor_position]
+        if len(cands) == 1 and cands[0] == token:
+            self.completion_close()
+            return
+        if not cands:
+            self.completion_close()
+            return
+        self._comp_start, self._comp_end = start, end
+        self._comp_items = cands
+        self._comp_idx = 0
+        self._render_completion()
+
+    # -- completion ------------------------------------------------------
+    def _completion_data(self) -> tuple[int, int, list[str]]:
+        inp = self.cmd_input
+        try:
+            scripts = sorted(os.listdir(SCRIPTS_DIR))
+        except OSError:
+            scripts = []
+        try:
+            sessions = sorted(f[:-6] for f in os.listdir(SESSIONS_DIR)
+                              if f.endswith(".jsonl"))
+        except OSError:
+            sessions = []
+        todos = sorted(self._todo_cards)
+        try:
+            skills = [s["name"] for s in list_skills()]
+        except Exception:
+            skills = []
+        return complete_token(inp.value, inp.cursor_position, self._history,
+                              self.session_cwd, scripts, sessions, todos,
+                              skills)
+
+    def _render_completion(self) -> None:
+        lv = self.completion
+        lv.clear()
+        for c in self._comp_items:
+            lv.append(ListItem(Label(c)))
+        lv.index = self._comp_idx
+        lv.add_class("open")
+        self.completion_open = True
+
+    def completion_close(self) -> None:
+        if not self.completion_open:
+            return
+        self.completion_open = False
+        self._comp_items = []
+        try:
+            self.completion.remove_class("open")
+            self.completion.clear()
+        except Exception:
+            pass
+
+    def completion_move(self, delta: int) -> None:
+        if not self._comp_items:
+            return
+        self._comp_idx = (self._comp_idx + delta) % len(self._comp_items)
+        try:
+            self.completion.index = self._comp_idx
+        except Exception:
+            pass
+
+    def completion_accept(self) -> bool:
+        """Accept the highlighted candidate. False when nothing to accept."""
+        if not self.completion_open or not self._comp_items:
+            return False
+        cand = self._comp_items[self._comp_idx]
+        self._apply_completion(self._comp_start, self._comp_end, cand,
+                               final=True)
+        if cand.endswith("/"):
+            # keep completing inside the directory
+            self.completion_close()
+            self.completion_accept_or_open()
+        else:
+            self.completion_close()
+        return True
+
+    def completion_accept_or_open(self) -> bool:
+        """Tab: accept the open highlight, or compute and show candidates.
+
+        Returns True when the key was consumed.
+        """
+        if self.completion_open:
+            return self.completion_accept()
+        start, end, cands = self._completion_data()
+        if not cands:
+            return False
+        if len(cands) == 1:
+            self._apply_completion(start, end, cands[0], final=True)
+            return True
+        token = self.cmd_input.value[start:self.cmd_input.cursor_position]
+        pref = os.path.commonprefix(cands)
+        if len(pref) > len(token):
+            self._apply_completion(start, end, pref)
+            return True
+        self._comp_start, self._comp_end = start, end
+        self._comp_items = cands
+        self._comp_idx = 0
+        self._render_completion()
+        return True
+
+    def _apply_completion(self, start: int, end: int, cand: str,
+                          final: bool = False) -> None:
+        inp = self.cmd_input
+        v = inp.value
+        if final and cand.startswith("/") and not cand.endswith("/"):
+            cand += " "  # accepted a /command — ready for its arguments
+        inp.value = v[:start] + cand + v[end:]
+        inp.cursor_position = start + len(cand)
 
     def _shell(self, cmd_text: str) -> None:
         """Run a shell command right here in the TUI (bash -lc)."""
@@ -1093,7 +1689,8 @@ class MuseCliApp(App):
             d = os.path.abspath(os.path.expanduser(arg or "~"))
             if os.path.isdir(d):
                 self.session_cwd = d
-                self._refresh_statusbar(f"cwd → {d}")
+                self._refresh_statusbar()
+                self.notify(f"cwd → {d}")
             else:
                 self.notify(f"no such directory: {arg or '~'}")
         elif name == "clear":
@@ -1166,10 +1763,22 @@ class MuseCliApp(App):
                 self.notify("usage: /autoapprove [on|off]")
         elif name == "export":
             self._export_session(arg)
+        elif name == "restart":
+            self._restart_self()
         elif name in ("quit", "q"):
             self.exit()
         else:
             self.notify(f"unknown command: /{name}  (try /help)")
+
+    def _restart_self(self) -> None:
+        """Restart this TUI: exit and let __main__ re-exec run.sh.
+
+        Picks up new code. State is safe: session history, cards and
+        settings are all persisted and restored on launch.
+        """
+        os.environ["MUSE_CLI_RESTART"] = "1"
+        self.notify("restarting…")
+        self.exit()
 
     def _export_session(self, arg: str) -> None:
         cards = [c for c in self.task_list.query(TaskCard)
@@ -1245,8 +1854,25 @@ class MuseCliApp(App):
         selection between task cards.
         """
         in_input = isinstance(self.focused, Input)
-        if event.key == "escape" and in_input:
-            self.query_one("#cmd", Input).blur()
+        if event.key == "escape":
+            # Esc with the completion dropdown open is consumed by CmdInput
+            # (closes the dropdown) and never reaches here.
+            now = time.monotonic()
+            if now - self._last_esc < self.DOUBLE_ESC_WINDOW:
+                self._last_esc = 0.0
+                self.action_stop_all()
+                event.prevent_default()
+            else:
+                self._last_esc = now
+                if in_input:
+                    self.cmd_input.blur()
+                event.prevent_default()
+        elif event.key == "shift+tab" and not in_input:
+            # CmdInput handles this when the box is focused.
+            self.action_toggle_auto_approve()
+            event.prevent_default()
+        elif event.key == "tab" and not in_input:
+            self.cmd_input.focus()
             event.prevent_default()
         elif event.key == "up" and in_input:
             self._hist_move(-1)
@@ -1255,7 +1881,7 @@ class MuseCliApp(App):
             self._hist_move(1)
             event.prevent_default()
         elif event.key == "slash" and not in_input:
-            self.query_one("#cmd", Input).focus()
+            self.cmd_input.focus()
             event.prevent_default()
         elif event.key in ("j", "down") and not in_input:
             self._move_selection(1)
@@ -1303,7 +1929,7 @@ class MuseCliApp(App):
     def _hist_move(self, delta: int) -> None:
         if not self._history:
             return
-        inp = self.query_one("#cmd", Input)
+        inp = self.cmd_input
         if self._hist_idx is None:
             self._hist_draft = inp.value
             self._hist_idx = len(self._history)
@@ -1426,6 +2052,26 @@ class MuseCliApp(App):
         cancel(card.rid)
         self.notify(f"cancelling: {card.task_text[:40]}")
 
+    def action_stop_all(self) -> None:
+        """Failsafe: double-Esc cancels everything currently running.
+
+        Kills in-process shell tasks and files cancel markers for bridge
+        tasks, same as `x` does for one task — just for all of them.
+        """
+        running = [c for c in self.cards.values() if not c.done]
+        if not running:
+            self.notify("nothing running")
+            return
+        for card in running:
+            proc = self._shell_procs.get(card.rid)
+            if proc is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            cancel(card.rid)
+        self.notify(f"stopping {len(running)} task(s) — double-Esc failsafe")
+
     def action_copy_task(self) -> None:
         card = self.cards.get(self.focused_rid or "")
         if card is None:
@@ -1466,12 +2112,18 @@ class MuseCliApp(App):
     def action_scroll_bottom(self) -> None:
         self.task_list.scroll_end(animate=False)
 
-    def _refresh_statusbar(self, extra: str = "") -> None:
+    # -- layout refresh: topline / modeline / activity / cwdline --
+    def _refresh_statusbar(self) -> None:
+        """Legacy name kept for call sites; refreshes the whole chrome."""
+        self._refresh_topline()
+        self._refresh_modeline()
+        self._refresh_activity()
+        self._refresh_cwdline()
+
+    def _refresh_topline(self) -> None:
         t = Text()
         t.append("muse-cli · ")
         t.append(f"[{self.instance_session}]", style="bold")
-        t.append(" · cwd: ")
-        t.append(self.session_cwd)
         t.append(" · bridge ")
         t.append("●", style="green")
         t.append(" · muse ")
@@ -1482,15 +2134,75 @@ class MuseCliApp(App):
         wtext, wstyle = self._watcher_segment()
         t.append(" · watcher ")
         t.append(wtext, style=wstyle)
-        active, waiting = self._task_counts()
-        if active:
-            t.append(f" · {active} active", style="cyan")
-        if waiting:
-            t.append(f" · {waiting} awaiting approval", style="yellow")
+        try:
+            self.topline.update(t)
+        except AttributeError:
+            pass
+
+    def _refresh_modeline(self) -> None:
+        """Always-visible approval mode: Approval mode (gray) / Auto mode (amber)."""
+        t = Text()
+        if self.settings.get("auto_approve"):
+            t.append("● Auto mode", style="yellow")
+        else:
+            t.append("● Approval mode", style="dim")
         if os.path.exists(PAUSED_PATH):
             t.append(" · ⏸ paused", style="yellow")
-        if self.settings.get("auto_approve"):
-            t.append(" · ⚡ auto-approve ON", style="yellow")
-        if extra:
-            t.append(f" · {extra}")
-        self.statusbar.update(t)
+        try:
+            self.modeline.update(t)
+        except AttributeError:
+            pass
+
+    # Activity line: a typing-indicator, not a card. Active tasks get an
+    # animated amber icon + a state word + the live description in gray;
+    # idle gets a static gray "Waiting for you".
+    DOUBLE_ESC_WINDOW = 0.7  # seconds between two Esc presses = stop all
+
+    STATE_WORDS = (
+        (("test", "spec", "pytest", "vitest", "jest"), "Testing"),
+        (("write", "edit", "creat", "patch", "implement"), "Coding"),
+        (("run", "exec", "build", "deploy", "install"), "Tinkering"),
+    )
+
+    def _state_word(self, card: TaskCard) -> str:
+        text = f"{card._step_text or ''} {card._line or ''} {card.task_text}".lower()
+        for keywords, word in self.STATE_WORDS:
+            if any(k in text for k in keywords):
+                return word
+        return "Thinking"
+
+    def _refresh_activity(self) -> None:
+        """Realtime status above the input: waiting (gray) vs doing (amber)."""
+        active = [c for c in self.cards.values()
+                  if not c.done and not c.awaiting]
+        waiting = sum(1 for c in self.cards.values() if c.awaiting)
+        t = Text()
+        if active:
+            first = max(active, key=lambda c: c.t0)
+            el = time.time() - first.t0
+            live = (first._step_text or first._line or first.task_text)[:52]
+            t.append(SPINNER[self._frame % len(SPINNER)] + " ", style="yellow")
+            t.append(self._state_word(first), style="yellow")
+            t.append(" · ", style="dim")
+            t.append(f"{live} · {el:.0f}s", style="dim")
+            if len(active) > 1:
+                t.append(f" · +{len(active) - 1} more", style="dim")
+        elif waiting:
+            t.append(f"◷ {waiting} awaiting approval — a approve · d deny",
+                     style="yellow")
+        else:
+            t.append("○ Waiting for you", style="dim")
+        try:
+            self.activity_left.update(t)
+            # Mini todo summary on the right, above the message box.
+            done, total = self._todo_counts()
+            self.activity_right.update(
+                Text(f"☑ {done}/{total}", style="dim") if total else "")
+        except AttributeError:
+            pass
+
+    def _refresh_cwdline(self) -> None:
+        try:
+            self.cwdline.update(Text(f"cwd: {self.session_cwd}", style="dim"))
+        except AttributeError:
+            pass

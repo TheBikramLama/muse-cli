@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 
 from . import __version__
 from .bridge import run_daemon
@@ -34,6 +36,20 @@ def main() -> None:
         claim("tui", args.session)
         from .app import MuseCliApp
         MuseCliApp(session=args.session).run()
+        # /restart (or the tui-cmd restart op) sets MUSE_CLI_RESTART: re-exec
+        # run.sh with the original argv so the new process picks up new code.
+        # execv keeps our pid, so the instance lock (keyed by pid) stays ours.
+        if os.environ.pop("MUSE_CLI_RESTART", None) == "1":
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            script = os.path.join(root, "run.sh")
+            try:
+                if os.path.isfile(script):
+                    os.execv(script, [script] + sys.argv[1:])
+                else:
+                    os.execv(sys.executable,
+                             [sys.executable, "-m", "muse_cli"] + sys.argv[1:])
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
