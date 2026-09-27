@@ -14,6 +14,7 @@ Replaces the old `muse-runner.py` (kept under `legacy/` for reference). Unlike t
 
 ```bash
 ./run.sh                          # creates .venv on first run, then launches the TUI
+./run.sh --session work           # named instance — run parallel TUIs side by side
 ./run.sh --daemon                 # bridge only, no TUI (plain stdout log)
 ```
 
@@ -46,6 +47,7 @@ Poll `~/.muse/results/<uuid>.json` until it appears, read it, delete it. Result:
 - `task` is the human-readable summary shown in the TUI — always set it.
 - `cmd` is an argv list, never a shell string.
 - `source` is `"muse"` or `"local"`; `reveal: true` shows commands immediately.
+- `"session": "work"` routes the request to the TUI started with `--session work` (default `"main"`). Each instance only runs its own session's requests.
 - `{"id": "<uuid>", "ping": true}` is a liveness check — the bridge answers `{"ok": true, "pong": true}` with no task card.
 
 Guardrails (live-editable in `~/.muse/settings.json`): executable allowlist, allowed cwd roots, timeouts, output caps. `GIT_TERMINAL_PROMPT=0` is set so git never hangs on credentials.
@@ -97,19 +99,34 @@ Slash commands in the input box: `/cd <dir>`, `/run <script>`, `/scripts`, `/set
 
 ## Sessions
 
-`/sessions` lists past sessions, `/session <name>` switches the session new tasks are logged to, and `/export [name]` writes the finished tasks as markdown to `~/.muse/exports/`.
+`/sessions` lists past sessions, `/session <name>` switches the history log new tasks are written to, and `/export [name]` writes the finished tasks as markdown to `~/.muse/exports/`.
+
+## Parallel instances (`--session`)
+
+Run several TUIs at once, one per named session:
+
+```bash
+./run.sh --session work
+./run.sh --session lipi
+```
+
+- Each instance claims a per-session lock (`~/.muse/muse-cli.<session>.pid`); starting the same session twice exits instead of double-running the queue. Session `main` keeps the historic `~/.muse/muse-cli.pid` path.
+- Queue items, plain-text messages and Muse replies carry a `"session"` tag, so each window only runs and shows its own work. Untagged items route to `main` (backwards compatible).
+- Claiming a queue file is atomic — parallel instances never execute the same request twice. If an instance dies mid-task, the next start re-queues its claimed file.
+- The status bar shows the instance name: `muse-cli · [work]`.
+- `/session <name>` is unchanged: it only switches the history log bucket new tasks are written to, not the instance.
 
 ## Queue controls
 
 `p` pauses the bridge (queue held, status bar shows `⏸ paused`); `p` again resumes. `r` retries the selected finished task as a fresh card.
 
-## Background daemon & single instance
+## Background daemon & per-session instances
 
-Only one bridge (TUI or daemon) runs at a time — the first one claims `~/.muse/muse-cli.pid`, and a second start exits instead of double-running the queue.
+One bridge (TUI or daemon) runs per session — the first claims its session lock, and a second start of the same session exits instead of double-running the queue. Different sessions run side by side freely.
 
-- `./run.sh --daemon` runs the bridge headless (plain stdout logging).
+- `./run.sh --daemon` runs the bridge headless (plain stdout logging); add `--session <name>` for a named session.
 - `./run.sh --install-launchd` installs it as a macOS LaunchAgent (`com.muse.cli`, logs to `~/.muse/daemon.log`); `--uninstall-launchd` removes it.
-- While the daemon runs, the TUI refuses to start — unload the daemon first to use the TUI.
+- While the daemon holds a session, the TUI refuses to start that same session — unload the daemon first to use the TUI for it.
 
 ## Approvals
 
@@ -148,7 +165,7 @@ Task requests can carry `"skills": ["name", …]`; the card shows a `⚙` badge 
 
 ## Muse inbox watcher
 
-Plain-text messages only become a conversation if something on the Muse side reads them. A scheduled job (every ~2 minutes) watches `~/.muse/messages/`, treats each new file as your instruction, does the work — via the same `~/.muse/queue/` bridge when it needs your Mac — and writes a Markdown reply to `~/.muse/replies/<id>.json`, which the TUI renders as a card. Each message is answered exactly once (processed IDs are tracked); your outgoing files are kept so the startup history view still works.
+Plain-text messages only become a conversation if something on the Muse side reads them. A scheduled job (every ~2 minutes) watches `~/.muse/messages/`, treats each new file as your instruction, does the work — via the same `~/.muse/queue/` bridge when it needs your Mac — and writes a Markdown reply to `~/.muse/replies/<id>.json`, which the TUI renders as a card. Each message is answered exactly once (processed IDs are tracked); your outgoing files are kept so the startup history view still works. Replies echo the message's `"session"` tag so they land in the right window.
 
 ## Roadmap ideas
 

@@ -31,9 +31,10 @@ from textual.widgets import Footer, Header, Input, Markdown, Static, TextArea
 
 from .bridge import Bridge
 from .config import load_settings, save_settings
-from .paths import (EXPORTS_DIR, INPUT_HISTORY_PATH, MESSAGES_DIR, PAUSED_PATH,
-                   REPLIES_DIR, SCRIPTS_DIR, SEEN_PATH, SESSIONS_DIR,
-                   SETTINGS_PATH, TODOS_DIR, ensure_dirs)
+from .paths import (DEFAULT_SESSION, EXPORTS_DIR, INPUT_HISTORY_PATH,
+                   MESSAGES_DIR, PAUSED_PATH, REPLIES_DIR, SCRIPTS_DIR,
+                   SEEN_PATH, SESSIONS_DIR, SETTINGS_PATH, TODOS_DIR,
+                   ensure_dirs, valid_session)
 from .protocol import cancel, new_id, submit
 from .runner import check_cwd
 from .sessions import load_recent, log_task, new_session
@@ -63,7 +64,9 @@ Slash commands:
   /autoapprove [on|off]  toggle auto-approval of approval requests
   /settings      show where settings.json lives
   /sessions      list past sessions (most recent first)
-  /session <name> switch the session new tasks are logged to
+  /session <name> switch the history log new tasks are logged to
+                 (the history bucket — not the instance. Parallel
+                 windows use ./run.sh --session <name>.)
   /export [name]  save this session's finished tasks as markdown
   /clear         remove finished task cards
   /help          this help
@@ -445,9 +448,14 @@ class MuseCliApp(App):
         ("g", "scroll_bottom", "Bottom"),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, session: str = DEFAULT_SESSION) -> None:
         super().__init__()
         self.settings = load_settings()
+        # Instance session (--session): this window only runs queue items,
+        # messages and replies tagged with it. Parallel windows use
+        # different sessions. Distinct from session_id below, which is just
+        # the history-log bucket new tasks are written to (/session).
+        self.instance_session = session if valid_session(session) else DEFAULT_SESSION
         self.session_id = new_session()
         self.session_cwd = os.getcwd()
         self.cards: dict[str, TaskCard] = {}
@@ -496,6 +504,7 @@ class MuseCliApp(App):
             on_result=self._cb_result,
             on_step=self._cb_step,
             on_approval=self._cb_approval,
+            session=self.instance_session,
         )
         self._bridge.start()
         for req in self._bridge.pending_approvals():
@@ -663,6 +672,10 @@ class MuseCliApp(App):
             text = payload.get("text")
             if not isinstance(text, str) or not text.strip():
                 continue
+            # Replies are routed per session; the watcher echoes the
+            # message's session tag. Missing tag = "main" (pre-session).
+            if payload.get("session", DEFAULT_SESSION) != self.instance_session:
+                continue
             card = MessageCard(mid, text, incoming=True,
                                at=payload.get("at") or time.time())
             self.task_list.mount(card)
@@ -782,6 +795,8 @@ class MuseCliApp(App):
                         p = json.load(f)
                     t = p.get("text")
                     if isinstance(t, str) and t.strip():
+                        if p.get("session", DEFAULT_SESSION) != self.instance_session:
+                            continue
                         items.append((p.get("at") or 0, incoming,
                                       name[:-5], t))
                 except (OSError, ValueError):
@@ -965,7 +980,7 @@ class MuseCliApp(App):
         ensure_dirs()
         mid = new_id()
         payload = {"id": mid, "from": "tui", "text": text,
-                   "at": time.time()}
+                   "at": time.time(), "session": self.instance_session}
         tmp = os.path.join(MESSAGES_DIR, mid + ".json.tmp")
         try:
             with open(tmp, "w") as f:
@@ -1011,7 +1026,8 @@ class MuseCliApp(App):
                 self.notify(f"no such script: {arg}")
                 return
             rid = submit(task=f"run script: {arg}", cmd=[p],
-                         cwd=self.session_cwd, source="local")
+                         cwd=self.session_cwd, source="local",
+                         session=self.instance_session)
             card = TaskCard(rid, f"run script: {arg}", "local", [p], self.session_cwd)
             self.cards[rid] = card
             self.focused_rid = rid
@@ -1289,8 +1305,9 @@ class MuseCliApp(App):
             self.notify("select a finished task to retry")
             return
         rid = submit(task=card.task_text, cmd=card.cmd, cwd=card.cwd,
-                     source="local", steps=card.steps or None)
-        new_card = TaskCard(rid, card.task_text, "local", card.cmd,
+                     source=card.source, steps=card.steps or None,
+                     session=self.instance_session)
+        new_card = TaskCard(rid, card.task_text, card.source, card.cmd,
                             card.cwd, steps=card.steps)
         self.cards[rid] = new_card
         self.focused_rid = rid
@@ -1361,7 +1378,7 @@ class MuseCliApp(App):
     def _refresh_statusbar(self, extra: str = "") -> None:
         t = Text()
         t.append("muse-cli · ")
-        t.append(self.session_id, style="bold")
+        t.append(f"[{self.instance_session}]", style="bold")
         t.append(" · cwd: ")
         t.append(self.session_cwd)
         t.append(" · bridge ")

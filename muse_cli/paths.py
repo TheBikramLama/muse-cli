@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 MUSE_HOME = os.path.expanduser("~/.muse")
 
@@ -13,13 +14,31 @@ SCRIPTS_DIR = os.path.join(MUSE_HOME, "scripts")
 CANCEL_DIR = os.path.join(MUSE_HOME, "cancel")
 APPROVAL_DIR = os.path.join(MUSE_HOME, "approval")
 EXPORTS_DIR = os.path.join(MUSE_HOME, "exports")
+SETTINGS_PATH = os.path.join(MUSE_HOME, "settings.json")
+PAUSED_PATH = os.path.join(MUSE_HOME, "paused")  # file, not dir: bridge holds the queue while it exists
+PID_PATH = os.path.join(MUSE_HOME, "muse-cli.pid")  # legacy guard path (session "main")
+INPUT_HISTORY_PATH = os.path.join(MUSE_HOME, "input_history")
+
+# Named instances: ./run.sh --session <name> runs parallel TUIs, one per
+# session. Queue items, messages and replies carry a "session" tag so each
+# instance only picks up its own work.
+DEFAULT_SESSION = "main"
+SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def valid_session(name: str) -> bool:
+    return bool(SESSION_RE.match(name or ""))
+
+
+def pid_path(session: str = DEFAULT_SESSION) -> str:
+    """Per-session instance lock. "main" keeps the historic path."""
+    if session == DEFAULT_SESSION:
+        return PID_PATH
+    return os.path.join(MUSE_HOME, f"muse-cli.{session}.pid")
+
 MESSAGES_DIR = os.path.join(MUSE_HOME, "messages")
 REPLIES_DIR = os.path.join(MUSE_HOME, "replies")
 TODOS_DIR = os.path.join(MUSE_HOME, "todos")
-SETTINGS_PATH = os.path.join(MUSE_HOME, "settings.json")
-PAUSED_PATH = os.path.join(MUSE_HOME, "paused")  # file, not dir: bridge holds the queue while it exists
-PID_PATH = os.path.join(MUSE_HOME, "muse-cli.pid")  # single-instance guard
-INPUT_HISTORY_PATH = os.path.join(MUSE_HOME, "input_history")
 SEEN_PATH = os.path.join(MUSE_HOME, ".seen_replies")  # reply ids already shown (json list)
 
 ALL_DIRS = [QUEUE_DIR, RESULTS_DIR, SESSIONS_DIR, SKILLS_DIR, SCRIPTS_DIR,

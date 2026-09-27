@@ -1,7 +1,8 @@
-"""Single-instance guard and launchd installation for muse-cli.
+"""Per-session instance guard and launchd installation for muse-cli.
 
-Only one bridge (TUI or --daemon) may run at a time: two instances racing
-the queue could execute the same request twice.
+One bridge (TUI or --daemon) may run per session: two instances racing the
+same session's queue could execute the same request twice. Different
+sessions (./run.sh --session <name>) run side by side freely.
 """
 from __future__ import annotations
 
@@ -10,12 +11,13 @@ import json
 import os
 import subprocess
 
-from .paths import MUSE_HOME, PID_PATH, ensure_dirs
+from .paths import (DEFAULT_SESSION, MUSE_HOME, pid_path,
+                    ensure_dirs, valid_session)
 
 LABEL = "com.muse.cli"
 
 
-def _pid_alive(pid: int) -> bool:
+def pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -27,38 +29,50 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def claim(mode: str) -> None:
-    """Claim the single instance slot. Exits if another live instance holds it."""
-    ensure_dirs()
-    if os.path.exists(PID_PATH):
-        try:
-            with open(PID_PATH) as f:
-                info = json.load(f)
-            pid = int(info.get("pid", 0))
-            other_mode = info.get("mode", "?")
-        except (OSError, ValueError):
-            pid, other_mode = 0, "?"
-        if pid and pid != os.getpid() and _pid_alive(pid):
-            print(f"muse-cli is already running as {other_mode} (pid {pid}).")
-            if other_mode == "daemon":
-                print("Unload it first: "
-                      "launchctl unload -w ~/Library/LaunchAgents/com.muse.cli.plist")
-            raise SystemExit(1)
+def _read_lock(path: str) -> tuple[int, str]:
     try:
-        with open(PID_PATH, "w") as f:
-            json.dump({"pid": os.getpid(), "mode": mode}, f)
+        with open(path) as f:
+            info = json.load(f)
+        return int(info.get("pid", 0)), info.get("mode", "?")
+    except (OSError, ValueError):
+        return 0, "?"
+
+
+def claim(mode: str, session: str = DEFAULT_SESSION) -> None:
+    """Claim the instance slot for a session. Exits if it's already held."""
+    if not valid_session(session):
+        print(f"bad session name: {session!r} "
+              "(letters, digits, _ and - only)")
+        raise SystemExit(1)
+    ensure_dirs()
+    lock = pid_path(session)
+    # For session "main" this is the historic path, so an old-version
+    # instance still holding it is seen here too.
+    pid, other_mode = _read_lock(lock)
+    if pid and pid != os.getpid() and pid_alive(pid):
+        print(f"muse-cli is already running session {session!r} "
+              f"as {other_mode} (pid {pid}).")
+        if other_mode == "daemon":
+            print("Unload it first: "
+                  "launchctl unload -w ~/Library/LaunchAgents/com.muse.cli.plist")
+        raise SystemExit(1)
+    try:
+        with open(lock, "w") as f:
+            json.dump({"pid": os.getpid(), "mode": mode,
+                       "session": session}, f)
     except OSError:
         print("warning: could not write the instance lock")
-    atexit.register(release)
+    atexit.register(release, lock)
 
 
-def release() -> None:
+def release(lock: str | None = None) -> None:
     """Drop the lock, but only if we still hold it."""
+    path = lock or pid_path()
     try:
-        with open(PID_PATH) as f:
+        with open(path) as f:
             info = json.load(f)
         if int(info.get("pid", 0)) == os.getpid():
-            os.remove(PID_PATH)
+            os.remove(path)
     except (OSError, ValueError):
         pass
 

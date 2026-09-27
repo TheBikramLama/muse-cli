@@ -20,11 +20,14 @@ import threading
 import time
 
 from .config import load_settings
-from .paths import APPROVAL_DIR, CANCEL_DIR, PAUSED_PATH, QUEUE_DIR, ensure_dirs
+from .instance import pid_alive
+from .paths import (APPROVAL_DIR, CANCEL_DIR, DEFAULT_SESSION, PAUSED_PATH,
+                    QUEUE_DIR, ensure_dirs)
 from .protocol import write_result
 from .runner import run_request, run_steps
 
 MAX_PARSE_ATTEMPTS = 20
+CLAIM_SUFFIX = ".claimed"  # <rid>.json.claimed.<pid> while an instance owns it
 
 
 def _rm(path: str) -> None:
@@ -65,8 +68,10 @@ def _call(cb, *args) -> None:
 
 class Bridge:
     def __init__(self, settings: dict, on_start=None, on_chunk=None, on_result=None,
-                 on_step=None, on_approval=None):
+                 on_step=None, on_approval=None,
+                 session: str = DEFAULT_SESSION):
         self.settings = settings
+        self.session = session or DEFAULT_SESSION
         self.on_start = on_start
         self.on_chunk = on_chunk
         self.on_result = on_result
@@ -80,6 +85,7 @@ class Bridge:
 
     # -- lifecycle --
     def start(self) -> None:
+        self._requeue_stale_claims()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="muse-bridge")
         self._thread.start()
 
@@ -87,10 +93,38 @@ class Bridge:
         self._stop.set()
 
     def run_forever(self) -> None:
+        self._requeue_stale_claims()
         try:
             self._loop()
         except KeyboardInterrupt:
             print("\nmuse bridge stopped.")
+
+    def _requeue_stale_claims(self) -> None:
+        """Files claimed by a dead instance never ran; put them back.
+
+        The claim name embeds the claiming pid, so a live instance's
+        in-flight tasks are never touched.
+        """
+        ensure_dirs()
+        try:
+            names = os.listdir(QUEUE_DIR)
+        except OSError:
+            return
+        for name in names:
+            base, sep, pid_s = name.rpartition(CLAIM_SUFFIX + ".")
+            if not sep or not base.endswith(".json") or not pid_s.isdigit():
+                continue
+            try:
+                alive = pid_alive(int(pid_s))
+            except Exception:
+                alive = False
+            if alive:
+                continue
+            try:
+                os.rename(os.path.join(QUEUE_DIR, name),
+                          os.path.join(QUEUE_DIR, base))
+            except OSError:
+                pass
 
     # -- main loop --
     def _loop(self) -> None:
@@ -135,8 +169,16 @@ class Bridge:
                 continue
             rid = name[:-5]
             path = os.path.join(QUEUE_DIR, name)
+            # Atomic claim: the rename wins for exactly one instance, so
+            # parallel TUIs (different sessions) never run the same request.
+            claimed = os.path.join(
+                QUEUE_DIR, f"{name}{CLAIM_SUFFIX}.{os.getpid()}")
             try:
-                with open(path) as f:
+                os.rename(path, claimed)
+            except OSError:
+                continue  # already claimed by another instance
+            try:
+                with open(claimed) as f:
                     req = json.load(f)
             except Exception:  # possibly a torn write; retry a few times
                 n = self._attempts.get(rid, 0) + 1
@@ -147,10 +189,21 @@ class Bridge:
                     res["summary"] = "could not read request file"
                     write_result(res)
                     self._attempts.pop(rid, None)
-                    _rm(path)
+                    _rm(claimed)
+                else:
+                    try:
+                        os.rename(claimed, path)  # release, retry next pass
+                    except OSError:
+                        pass
                 continue
             self._attempts.pop(rid, None)
-            _rm(path)
+            if req.get("session", DEFAULT_SESSION) != self.session:
+                # Another session's work: release the claim untouched.
+                try:
+                    os.rename(claimed, path)
+                except OSError:
+                    pass
+                continue
             if req.get("ping"):
                 # Liveness check (old muse-runner.py protocol): answer
                 # directly, no task card and no callbacks.
@@ -162,66 +215,73 @@ class Bridge:
                     "source": req.get("source", "muse"),
                     "summary": "pong",
                 })
+                _rm(claimed)
                 continue
-            t = threading.Thread(target=self._run_one, args=(req,), daemon=True,
+            t = threading.Thread(target=self._run_one, args=(req, claimed),
+                                 daemon=True,
                                  name=f"muse-task-{rid[:8]}")
             t.start()
 
-    def _run_one(self, req: dict) -> None:
+    def _run_one(self, req: dict, claimed: str) -> None:
         rid = req.get("id", "?")
-        if rid in self._cancelled:
-            # Cancelled while queued: never start it.
-            self._cancelled.discard(rid)
-            res = _cancelled_result(req)
+        try:
+            if rid in self._cancelled:
+                # Cancelled while queued: never start it.
+                self._cancelled.discard(rid)
+                res = _cancelled_result(req)
+                write_result(res)
+                _call(self.on_result, res)
+                return
+
+            if (req.get("needs_approval") and not req.get("approved")
+                    and not self.settings.get("auto_approve")):
+                # Park it for a human decision; the TUI approves (a) or denies (d).
+                # Skipped entirely when auto_approve is on in settings.
+                ensure_dirs()
+                try:
+                    with open(os.path.join(APPROVAL_DIR, rid + ".json"), "w") as f:
+                        json.dump(req, f)
+                except OSError:
+                    pass
+                _call(self.on_approval, req)
+                return
+
+            _call(self.on_start, req)
+
+            def _chunk(line: str) -> None:
+                _call(self.on_chunk, rid, line)
+
+            def _got_proc(proc) -> None:
+                self._procs[rid] = proc
+
+            def _step(i: int, n: int, name: str) -> None:
+                _call(self.on_step, rid, i, n, name)
+
+            try:
+                res = run_steps(req, self.settings, on_chunk=_chunk, on_proc=_got_proc,
+                                on_step=_step,
+                                is_cancelled=lambda: rid in self._cancelled)
+            finally:
+                self._procs.pop(rid, None)
+
+            if rid in self._cancelled:
+                self._cancelled.discard(rid)
+                res["ok"] = False
+                res["error"] = "cancelled"
+                res["summary"] = "cancelled"
+                res["exit"] = None
+            if req.get("skills"):
+                res["skills"] = list(req["skills"])
             write_result(res)
             _call(self.on_result, res)
-            return
-
-        if (req.get("needs_approval") and not req.get("approved")
-                and not self.settings.get("auto_approve")):
-            # Park it for a human decision; the TUI approves (a) or denies (d).
-            # Skipped entirely when auto_approve is on in settings.
-            ensure_dirs()
-            try:
-                with open(os.path.join(APPROVAL_DIR, rid + ".json"), "w") as f:
-                    json.dump(req, f)
-            except OSError:
-                pass
-            _call(self.on_approval, req)
-            return
-
-        _call(self.on_start, req)
-
-        def _chunk(line: str) -> None:
-            _call(self.on_chunk, rid, line)
-
-        def _got_proc(proc) -> None:
-            self._procs[rid] = proc
-
-        def _step(i: int, n: int, name: str) -> None:
-            _call(self.on_step, rid, i, n, name)
-
-        try:
-            res = run_steps(req, self.settings, on_chunk=_chunk, on_proc=_got_proc,
-                            on_step=_step,
-                            is_cancelled=lambda: rid in self._cancelled)
         finally:
-            self._procs.pop(rid, None)
-
-        if rid in self._cancelled:
-            self._cancelled.discard(rid)
-            res["ok"] = False
-            res["error"] = "cancelled"
-            res["summary"] = "cancelled"
-            res["exit"] = None
-        if req.get("skills"):
-            res["skills"] = list(req["skills"])
-        write_result(res)
-        _call(self.on_result, res)
+            _rm(claimed)
 
     # -- approvals --
     def pending_approvals(self) -> list[dict]:
-        """Requests parked in the approval dir (e.g. across a restart)."""
+        """Requests parked in the approval dir (e.g. across a restart).
+
+        Only this session's requests: each instance approves its own."""
         reqs: list[dict] = []
         try:
             names = sorted(os.listdir(APPROVAL_DIR))
@@ -232,9 +292,11 @@ class Bridge:
                 continue
             try:
                 with open(os.path.join(APPROVAL_DIR, name)) as f:
-                    reqs.append(json.load(f))
+                    req = json.load(f)
             except Exception:
                 continue
+            if req.get("session", DEFAULT_SESSION) == self.session:
+                reqs.append(req)
         return reqs
 
     def approve(self, rid: str) -> bool:
@@ -286,10 +348,11 @@ class Bridge:
         return True
 
 
-def run_daemon() -> None:
+def run_daemon(session: str = DEFAULT_SESSION) -> None:
     settings = load_settings()
     ensure_dirs()
     print("muse bridge online.")
+    print(f"  session: {session}")
     print(f"  queue:   {QUEUE_DIR}")
     print(f"  allowed: {', '.join(sorted(settings.get('allowlist', [])))}")
     print(f"  roots:   {', '.join(settings.get('allowed_roots', [])) or '(anywhere)'}")
@@ -299,4 +362,4 @@ def run_daemon() -> None:
         task = res.get("task") or " ".join(res.get("cmd", []))
         print(f"[{res.get('source')}] {task} -> {res.get('summary')}")
 
-    Bridge(settings, on_result=_show).run_forever()
+    Bridge(settings, on_result=_show, session=session).run_forever()

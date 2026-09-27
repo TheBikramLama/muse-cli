@@ -8,8 +8,12 @@ Two-way bridge:
 Request::
     {"id": str, "task": str, "cmd": [str, ...], "cwd": str|None,
      "timeout": int|None, "source": "muse"|"local", "reveal": bool,
-     "submitted_at": float,
+     "submitted_at": float, "session": str,
      "steps": [{"name": str, "cmd": [str, ...], "cwd": str|None}] | None}
+
+`session` (default "main") routes the request to the TUI instance started
+with `--session <name>`. Instances only run their own session's requests,
+so parallel windows never race the queue.
 
 `task` is the human summary shown in the TUI ("Sync feature branch"),
 `cmd` stays hidden unless revealed. `reveal: true` shows commands immediately.
@@ -30,7 +34,8 @@ import os
 import time
 import uuid
 
-from .paths import CANCEL_DIR, QUEUE_DIR, RESULTS_DIR, ensure_dirs
+from .paths import (CANCEL_DIR, DEFAULT_SESSION, QUEUE_DIR, RESULTS_DIR,
+                    ensure_dirs)
 
 
 def new_id() -> str:
@@ -47,8 +52,14 @@ def _atomic_write(path: str, payload: dict) -> None:
 def submit(task: str, cmd: list | None = None, cwd: str | None = None,
            timeout: int | None = None, source: str = "local",
            reveal: bool = False, steps: list | None = None,
-           skills: list | None = None) -> str:
-    """Queue a request. Returns its id."""
+           skills: list | None = None,
+           session: str = DEFAULT_SESSION) -> str:
+    """Queue a request. Returns its id.
+
+    `session` routes the request to the TUI instance running with
+    --session <name> (default "main"). Instances ignore other sessions'
+    requests.
+    """
     ensure_dirs()
     rid = new_id()
     req = {
@@ -60,6 +71,7 @@ def submit(task: str, cmd: list | None = None, cwd: str | None = None,
         "source": source,
         "reveal": reveal,
         "submitted_at": time.time(),
+        "session": session or DEFAULT_SESSION,
     }
     if steps:
         req["steps"] = steps
