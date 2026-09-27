@@ -25,6 +25,9 @@ DEFAULTS: dict = {
     # When true, requests flagged needs_approval skip the approval park and
     # run immediately. Default off — approve/deny stays a human decision.
     "auto_approve": False,
+    # Heartbeat: TUI pings Muse for updates every N minutes (0 = off).
+    # /heartbeat <minutes> enables, /heartbeat off disables.
+    "heartbeat_minutes": 0,
     "tui": {
         "poll_interval": 0.5,
         "history_limit": 50,

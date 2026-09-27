@@ -22,6 +22,7 @@ import selectors
 import subprocess
 import threading
 import time
+import uuid
 
 from rich.text import Text
 from textual import events
@@ -49,9 +50,9 @@ CHUNK_THROTTLE_S = 0.15
 
 # -- input completion (zsh-style suggestions for / and !) -------------------
 SLASH_COMMANDS = [
-    "/autoapprove", "/cd", "/clear", "/export", "/help", "/quit",
-    "/restart", "/run", "/scripts", "/session", "/sessions", "/settings",
-    "/sidebar", "/skill", "/skills", "/todo", "/todos",
+    "/autoapprove", "/cd", "/clear", "/export", "/heartbeat", "/help",
+    "/quit", "/restart", "/run", "/scripts", "/session", "/sessions",
+    "/settings", "/sidebar", "/skill", "/skills", "/todo", "/todos",
 ]
 SKILL_SUBCOMMANDS = ["install", "remove", "show"]
 COMP_MAX = 10
@@ -190,6 +191,7 @@ Slash commands:
   /todos         show your todo lists in the sidebar
   /todo <name>   expand a todo list in the sidebar
   /sidebar       toggle the todo sidebar (works on narrow terminals too)
+  /heartbeat <m> ping Muse for updates every m minutes (/heartbeat off)
   /autoapprove [on|off]  toggle auto-approval of approval requests
   /settings      show where settings.json lives
   /sessions      list past sessions (most recent first)
@@ -778,6 +780,10 @@ class MuseCliApp(App):
         # a manual override (hide, or show even on a narrow terminal).
         self._sidebar_manual_hide = False
         self._sidebar_manual_show = False
+        # Heartbeat: periodic ping to Muse for updates. Timer handle,
+        # last tick time, restored from settings on mount.
+        self._heartbeat_timer = None
+        self._heartbeat_last = 0.0
         # Double-Esc failsafe: two presses within this window stop everything.
         self._last_esc = 0.0
 
@@ -848,6 +854,14 @@ class MuseCliApp(App):
 
     def on_mount(self) -> None:
         self._refresh_statusbar()
+        # Restore heartbeat timer if it was enabled in settings.
+        hb = self.settings.get("heartbeat_minutes", 0)
+        if hb:
+            try:
+                self._heartbeat_timer = self.set_interval(
+                    int(hb) * 60, self._heartbeat_tick)
+            except Exception:
+                pass
         self.empty_state = Static(
             "no tasks yet — /help for commands · ! for shell · plain text messages Muse",
             id="empty")
@@ -1774,11 +1788,27 @@ class MuseCliApp(App):
             else:
                 self.notify(f"no such directory: {arg or '~'}")
         elif name == "clear":
+            n = 0
             for rid, card in list(self.cards.items()):
-                if card.done:
+                try:
                     card.remove()
-                    del self.cards[rid]
+                except Exception:
+                    pass
+                del self.cards[rid]
+                n += 1
+            for mid in list(self._msg_cards.keys()):
+                try:
+                    self._msg_cards[mid].remove()
+                except Exception:
+                    pass
+                del self._msg_cards[mid]
+                n += 1
             self.focused_rid = None
+            try:
+                self._refresh_statusbar()
+            except Exception:
+                pass
+            self.notify(f"Cleared {n} card(s)")
         elif name == "help":
             self.task_list.mount(Static(HELP_TEXT, classes="help-card"))
             self.task_list.scroll_end(animate=False)
@@ -1845,6 +1875,8 @@ class MuseCliApp(App):
                 self._set_auto_approve(False)
             else:
                 self.notify("usage: /autoapprove [on|off]")
+        elif name == "heartbeat":
+            self._heartbeat_cmd(arg)
         elif name == "export":
             self._export_session(arg)
         elif name == "restart":
@@ -2240,18 +2272,110 @@ class MuseCliApp(App):
             pass
 
     def _refresh_modeline(self) -> None:
-        """Always-visible approval mode: Approval mode (gray) / Auto mode (amber)."""
+        """Second line after chatbox: mode · Muse link · heartbeat."""
         t = Text()
         if self.settings.get("auto_approve"):
             t.append("● Auto mode", style="yellow")
         else:
             t.append("● Approval mode", style="dim")
+        # Muse connection: explicit CLI<->Muse link state from watcher freshness.
+        t.append(" · CLI ↔ Muse ")
+        if self._muse_running:
+            t.append("● working", style="green")
+        else:
+            wtext, wstyle = self._watcher_segment()
+            if wtext == "●" and wstyle == "green":
+                t.append("● connected", style="green")
+            else:
+                t.append(f"● {wtext}", style=wstyle)
+        # Heartbeat status.
+        hb = self.settings.get("heartbeat_minutes", 0)
+        if hb:
+            t.append(f" · ♥ {hb}m", style="cyan")
+            if self._heartbeat_last:
+                ago = int((time.time() - self._heartbeat_last) // 60)
+                t.append(f" (last {ago}m ago)", style="dim")
         if os.path.exists(PAUSED_PATH):
             t.append(" · ⏸ paused", style="yellow")
         try:
             self.modeline.update(t)
         except AttributeError:
             pass
+
+    # -- heartbeat: periodic ping to Muse for updates --
+    def _heartbeat_cmd(self, arg: str) -> None:
+        """/heartbeat [minutes|off] — ping Muse for updates on a timer."""
+        arg = (arg or "").strip().lower()
+        if not arg:
+            hb = self.settings.get("heartbeat_minutes", 0)
+            if hb:
+                self.notify(f"♥ heartbeat every {hb}m")
+            else:
+                self._heartbeat_start(5)
+                self.notify("♥ heartbeat every 5m — updates will appear here")
+            return
+        if arg in ("off", "0", "stop", "disable"):
+            self._heartbeat_stop()
+            self.notify("♥ heartbeat off")
+            return
+        try:
+            mins = int(arg)
+            if mins < 1 or mins > 1440:
+                raise ValueError
+        except ValueError:
+            self.notify("usage: /heartbeat <minutes|off> (1–1440)")
+            return
+        self._heartbeat_start(mins)
+        self.notify(f"♥ heartbeat every {mins}m — updates will appear here")
+
+    def _heartbeat_start(self, mins: int) -> None:
+        self._heartbeat_stop()
+        self.settings["heartbeat_minutes"] = mins
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
+        self._heartbeat_timer = self.set_interval(mins * 60,
+                                                  self._heartbeat_tick)
+        self._refresh_modeline()
+
+    def _heartbeat_stop(self) -> None:
+        if self._heartbeat_timer is not None:
+            try:
+                self._heartbeat_timer.stop()
+            except Exception:
+                pass
+            self._heartbeat_timer = None
+        self.settings["heartbeat_minutes"] = 0
+        try:
+            save_settings(self.settings)
+        except Exception:
+            pass
+        self._refresh_modeline()
+
+    def _heartbeat_tick(self) -> None:
+        """Every interval: ask Muse for the latest updates via the inbox."""
+        self._heartbeat_last = time.time()
+        mid = f"hb-{uuid.uuid4().hex[:8]}"
+        payload = {
+            "mid": mid,
+            "at": time.time(),
+            "session": self.instance_session,
+            "source": "muse",
+            "heartbeat": True,
+            "text": ("♥ heartbeat — please reply with any updates: "
+                       "task progress, new messages, things needing my "
+                       "attention. If nothing new, a brief 'all quiet' is fine."),
+        }
+        try:
+            ensure_dirs()
+            tmp = os.path.join(MESSAGES_DIR, mid + ".json.tmp")
+            with open(tmp, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, os.path.join(MESSAGES_DIR, mid + ".json"))
+        except Exception:
+            pass
+        self._refresh_modeline()
 
     # Activity line: a typing-indicator, not a card. Active tasks get an
     # animated amber icon + a state word + the live description in gray;
@@ -2323,7 +2447,7 @@ class MuseCliApp(App):
             t.append(" • ", style="dim")
             t.append(branch, style="dim")
             t.append(" ")
-            t.append("●", style="yellow" if dirty else "green")
+            t.append("●", style="orange" if dirty else "green")
         try:
             self.cwdline.update(t)
         except AttributeError:
