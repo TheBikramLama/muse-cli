@@ -26,6 +26,7 @@ import time
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
+from textual.command import CommandPalette, Hit, Hits, Provider
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.screen import Screen
 from textual.widgets import (Footer, Header, Input, Label, ListItem, ListView,
@@ -186,8 +187,8 @@ Slash commands:
   /skill install <git-url|path>   install a Claude-compatible skill
   /skill remove <name>            remove a skill
   /skill show <name>              read a skill's SKILL.md
-  /todos         list your todo lists
-  /todo <name>   jump to a todo list
+  /todos         show your todo lists in the sidebar
+  /todo <name>   expand a todo list in the sidebar
   /autoapprove [on|off]  toggle auto-approval of approval requests
   /settings      show where settings.json lives
   /sessions      list past sessions (most recent first)
@@ -283,7 +284,7 @@ class TaskCard(Vertical):
         self.live = Static("queued…", classes="live-line")
         yield self.live
 
-    def on_click(self) -> None:
+    def on_click(self, event: events.Click) -> None:
         app = self.app
         if isinstance(app, MuseCliApp):
             app.focused_rid = self.rid
@@ -489,78 +490,20 @@ class MessageCard(Vertical):
             pass  # not composed yet; compose() picks up _status_text
 
 
-class TodoCard(Vertical):
-    """A live markdown checklist from ~/.muse/todos/<name>.md.
+def _parse_todo(text: str) -> tuple[int, int, list[tuple[bool, str]]]:
+    """Parse a markdown checklist.
 
-    The file is the source of truth: edit it (or let Muse edit it) and
-    the card re-renders with fresh checkboxes and n/m progress.
+    Returns (done, total, items) where items is a list of
+    (checked, label) for every "- [ ]"/"- [x]" line. The file stays the
+    source of truth; this is just the rendering model for the sidebar.
     """
-
-    def __init__(self, name: str) -> None:
-        super().__init__(classes="todo-card")
-        self.tname = name
-        self.path = os.path.join(TODOS_DIR, name)
-        self._mtime = 0.0
-        self._composed = False
-        self._pending_text: str | None = None
-        self.progress_text = ""
-
-    def compose(self) -> ComposeResult:
-        with Horizontal(classes="task-head"):
-            yield Static("☑", classes="ticon done")
-            title = self.tname[:-3] if self.tname.endswith(".md") else self.tname
-            yield Static(title, classes="task-title")
-            self.progress = Static("", classes="task-src")
-            yield self.progress
-        self.body = Markdown("", classes="msg-body")
-        yield self.body
-
-    def on_mount(self) -> None:
-        self._composed = True
-        if self._pending_text is not None:
-            text, self._pending_text = self._pending_text, None
-            self._apply_text(text)
-
-    def refresh_if_changed(self) -> bool:
-        """Re-render when the file changed. False when the file is gone."""
-        try:
-            mtime = os.path.getmtime(self.path)
-        except OSError:
-            return False
-        if mtime == self._mtime and self._composed:
-            return True
-        self._mtime = mtime
-        try:
-            with open(self.path) as f:
-                text = f.read()
-        except OSError:
-            return False
-        if not self._composed:
-            self._pending_text = text
-            self.progress_text = self._progress_of(text)
-            return True
-        self._apply_text(text)
-        return True
-
-    @staticmethod
-    def _progress_of(text: str) -> str:
-        done = len(re.findall(r"^\s*[-*]\s+\[x\]", text, re.M | re.I))
-        open_ = len(re.findall(r"^\s*[-*]\s+\[ \]", text, re.M))
-        total = done + open_
-        return f"{done}/{total}" if total else "empty"
-
-    def _apply_text(self, text: str) -> None:
-        self.progress_text = self._progress_of(text)
-        if self._composed:
-            self.progress.update(self.progress_text)
-        # Real checkboxes regardless of the markdown renderer's task-list support.
-        pretty = re.sub(r"^(\s*[-*]\s+)\[ \]", r"\1☐", text, flags=re.M)
-        pretty = re.sub(r"^(\s*[-*]\s+)\[x\]", r"\1☑", pretty, flags=re.M | re.I)
-        if self._composed:
-            try:
-                self.body.update(pretty)
-            except Exception:
-                pass
+    items: list[tuple[bool, str]] = []
+    for line in text.splitlines():
+        m = re.match(r"^\s*[-*]\s+\[( |x|X)\]\s*(.*)$", line)
+        if m:
+            items.append((m.group(1).lower() == "x", m.group(2).strip()))
+    done = sum(1 for c, _ in items if c)
+    return done, len(items), items
 
 
 class CmdInput(Input):
@@ -587,6 +530,9 @@ class CmdInput(Input):
         elif app.completion_open:
             if key == "escape":
                 app.completion_close()
+                # Count the press toward double-Esc so the failsafe needs
+                # exactly two presses even with the dropdown open.
+                app._esc_tap(blur=False)
             elif key == "up":
                 app.completion_move(-1)
             elif key == "down":
@@ -610,17 +556,65 @@ class MuseScreen(Screen):
                 if b.key not in ("tab", "shift+tab")]
 
 
-class TodoRow(Static):
-    """One clickable todo-list row in the sidebar."""
+class TodoHead(Static):
+    """One clickable todo-list header in the sidebar.
+
+    Clicking expands this list (collapsing the others — one at a time).
+    """
 
     def __init__(self, name: str) -> None:
-        super().__init__("", classes="todo-row")
+        super().__init__("", classes="todo-head")
         self.tname = name
 
-    def on_click(self) -> None:
+    def on_click(self, event: events.Click) -> None:
         app = self.app
         if isinstance(app, MuseCliApp):
-            app.scroll_to_todo(self.tname)
+            app.expand_todo(self.tname)
+
+
+class MuseCommands(Provider):
+    """Our app actions in the ^p command palette.
+
+    Textual's palette only knows its own system commands (Quit, Theme,
+    Screenshot, ...). This provider adds the actions from our key bar so
+    they're searchable and runnable by keyboard.
+    """
+
+    COMMANDS: list[tuple[str, str, str]] = [
+        # (action name, title, help text)
+        ("toggle_sidebar", "Toggle todo sidebar",
+         "show or hide the todo sidebar"),
+        ("toggle_pause", "Pause / resume queue",
+         "hold the task queue or let it run"),
+        ("toggle_auto_approve", "Toggle auto-approve mode",
+         "approval requests run immediately, or park for a/d"),
+        ("approve_task", "Approve selected task",
+         "approve the selected approval request"),
+        ("deny_task", "Deny selected task",
+         "deny the selected approval request"),
+        ("retry_task", "Retry selected task",
+         "re-run the selected task"),
+        ("cancel_task", "Cancel selected task",
+         "cancel the selected task"),
+        ("save_output", "Save selected task output",
+         "save the selected task's output to exports/"),
+        ("copy_task", "Copy selected task detail",
+         "copy the selected task's detail to the clipboard"),
+        ("toggle_detail", "Toggle task detail",
+         "show or hide a task's commands and full output"),
+        ("scroll_bottom", "Scroll to bottom",
+         "jump the task list to the newest card"),
+    ]
+
+    async def search(self, query: str) -> Hits:
+        app = self.screen.app
+        matcher = self.matcher(query)
+        for action, title, help_text in self.COMMANDS:
+            if (score := matcher.match(title)) > 0:
+                callback = getattr(app, "action_" + action, None)
+                if callable(callback):
+                    yield Hit(score, matcher.highlight(title), callback,
+                              help=help_text)
 
 
 class MuseCliApp(App):
@@ -645,8 +639,17 @@ class MuseCliApp(App):
     }
     #todoside.hidden { display: none; }
     .todo-side-head { text-style: bold; color: $text-muted; margin-bottom: 1; }
-    .todo-row { height: 1; color: $text; }
-    .todo-row:hover { background: $surface-lighten-1; }
+    .todo-head { height: 1; color: $text; text-style: bold; }
+    .todo-head:hover { background: $surface-lighten-1; }
+    .todo-item { height: auto; color: $text; padding-left: 2; }
+    .todo-item.done { color: $text-muted; }
+    .todo-sec { height: auto; margin-bottom: 1; }
+    /* Command palette: keep it off the screen edges with a visible frame. */
+    CommandPalette > Vertical {
+        margin: 2 8;
+        height: 1fr;
+        border: solid $primary-darken-2;
+    }
     #activitybar {
         height: 1; padding: 0 1;
         background: $surface-darken-1;
@@ -710,11 +713,6 @@ class MuseCliApp(App):
     }
     .msg-card.incoming { border: solid $primary-darken-2; }
     .msg-body { height: auto; }
-    .todo-card {
-        border: solid $accent-darken-2;
-        margin: 0 1 1 1; padding: 0 1;
-        height: auto;
-    }
     """
     BINDINGS = [
         ("q", "quit", "Quit"),
@@ -730,6 +728,11 @@ class MuseCliApp(App):
         ("y", "copy_task", "Copy"),
         ("g", "scroll_bottom", "Bottom"),
     ]
+    # ^p command palette: Textual's system commands plus our own provider.
+    COMMANDS = App.COMMANDS | {MuseCommands}
+    # Below this terminal width the todo sidebar auto-hides — on a narrow
+    # screen it eats too much of the chat. The ☑ n/m aggregate stays.
+    SIDEBAR_MIN_WIDTH = 100
 
     def __init__(self, session: str = DEFAULT_SESSION) -> None:
         super().__init__()
@@ -755,7 +758,9 @@ class MuseCliApp(App):
         self._shell_procs: dict[str, object] = {}
         self._seen_replies: set[str] = self._load_seen()
         self._poll_n = 0
-        self._todo_cards: dict[str, TodoCard] = {}
+        self._todo_data: dict[str, dict] = {}
+        self._todo_expanded: str | None = None
+        self._sidebar_key: object = None
         # Watcher visibility: last ~/.muse/watcher.json payload (None = never
         # seen) plus outgoing message cards by mid for status updates.
         self._watcher: dict | None = None
@@ -980,7 +985,7 @@ class MuseCliApp(App):
         self._frame += 1
         for card in self.cards.values():
             card.tick(self._frame)
-        show_empty = not self.cards and not self._todo_cards
+        show_empty = not self.cards and not self._todo_data
         if show_empty != self._empty_shown:
             self._empty_shown = show_empty
             self.empty_state.display = show_empty
@@ -1108,33 +1113,44 @@ class MuseCliApp(App):
 
     # -- todos: ~/.muse/todos/*.md watched live --
     def _poll_todos(self) -> None:
+        # Todo lists live ONLY in the sidebar now — no chat cards.
+        # Files under ~/.muse/todos/*.md are the source of truth.
         ensure_dirs()
         try:
             names = sorted(f for f in os.listdir(TODOS_DIR)
                            if f.endswith(".md"))
         except OSError:
             names = []
+        seen = set()
         for name in names:
-            card = self._todo_cards.get(name)
-            if card is None:
-                card = TodoCard(name)
-                self._todo_cards[name] = card
-                self.task_list.mount(card)
-                self.task_list.scroll_end(animate=False)
-            if not card.refresh_if_changed():
-                self._drop_todo(name)
-        for name in list(self._todo_cards):
-            if name not in names:
-                self._drop_todo(name)
-        self._refresh_sidebar()
-
-    def _drop_todo(self, name: str) -> None:
-        card = self._todo_cards.pop(name, None)
-        if card is not None:
+            p = os.path.join(TODOS_DIR, name)
             try:
-                card.remove()
-            except Exception:
-                pass
+                mtime = os.path.getmtime(p)
+            except OSError:
+                continue
+            rec = self._todo_data.get(name)
+            if rec is None or rec.get("mtime") != mtime:
+                try:
+                    with open(p) as f:
+                        text = f.read()
+                except OSError:
+                    continue
+                done, total, items = _parse_todo(text)
+                self._todo_data[name] = {"mtime": mtime, "done": done,
+                                         "total": total, "items": items}
+            seen.add(name)
+        for name in list(self._todo_data):
+            if name not in seen:
+                del self._todo_data[name]
+        if self._todo_expanded not in self._todo_data:
+            self._todo_expanded = None
+            for name in sorted(self._todo_data):
+                if self._todo_data[name]["done"] < self._todo_data[name]["total"]:
+                    self._todo_expanded = name
+                    break
+            if self._todo_expanded is None and self._todo_data:
+                self._todo_expanded = sorted(self._todo_data)[0]
+        self._refresh_sidebar()
 
     # -- remote control: ~/.muse/tui-cmd/*.json ------------------------------
     # Any Muse chat (or script) can drive this TUI window by dropping a
@@ -1219,12 +1235,8 @@ class MuseCliApp(App):
     # -- todo sidebar -------------------------------------------------------
     def _todo_counts(self) -> tuple[int, int]:
         """(done, total) summed across todo lists."""
-        done = total = 0
-        for card in self._todo_cards.values():
-            m = re.match(r"(\d+)/(\d+)$", card.progress_text)
-            if m:
-                done += int(m.group(1))
-                total += int(m.group(2))
+        done = sum(r["done"] for r in self._todo_data.values())
+        total = sum(r["total"] for r in self._todo_data.values())
         return done, total
 
     def _has_active_todos(self) -> bool:
@@ -1236,60 +1248,95 @@ class MuseCliApp(App):
             side = self.todoside
         except AttributeError:
             return
-        for row in list(side.query(TodoRow)):
-            try:
-                row.remove()
-            except Exception:
-                pass
-        for name in sorted(self._todo_cards):
-            card = self._todo_cards[name]
-            row = TodoRow(name)
-            row.update(self._todo_row_text(name, card.progress_text))
-            side.mount(row)
-        visible = self._has_active_todos() and not self._sidebar_manual_hide
+        # The 1s poll calls this constantly; only rebuild the DOM when the
+        # underlying data changed, so clicks land on stable widgets.
+        key = (tuple(sorted((n, r["mtime"]) for n, r in self._todo_data.items())),
+               self._todo_expanded)
+        if key != self._sidebar_key:
+            self._sidebar_key = key
+            for sec in list(side.query(".todo-sec")):
+                try:
+                    sec.remove()
+                except Exception:
+                    pass
+            for name in sorted(self._todo_data):
+                rec = self._todo_data[name]
+                expanded = name == self._todo_expanded
+                sec = Vertical(classes="todo-sec")
+                side.mount(sec)
+                head = TodoHead(name)
+                head.update(self._todo_head_text(
+                    name, rec["done"], rec["total"], expanded))
+                sec.mount(head)
+                if expanded:
+                    for checked, label in rec["items"]:
+                        mark = "☑" if checked else "☐"
+                        sec.mount(Static(
+                            f"{mark} {label}",
+                            classes="todo-item done" if checked else "todo-item"))
+                    if not rec["items"]:
+                        sec.mount(Static("(empty)", classes="todo-item done"))
+        visible = (self._has_active_todos()
+                   and not self._sidebar_manual_hide
+                   and self._sidebar_fits())
         try:
             side.set_class(not visible, "hidden")
         except Exception:
             pass
         self._refresh_activity()
 
-    def _todo_row_text(self, name: str, progress: str) -> Text:
+    def _sidebar_fits(self) -> bool:
+        """Whether the terminal is wide enough for the todo sidebar."""
+        try:
+            return self.size.width >= self.SIDEBAR_MIN_WIDTH
+        except Exception:
+            return True
+
+    def on_resize(self, event: events.ResizeEvent) -> None:
+        # Re-evaluate the narrow-screen sidebar auto-hide.
+        self._refresh_sidebar()
+
+    def _todo_head_text(self, name: str, done: int, total: int,
+                        expanded: bool) -> Text:
         t = Text()
         short = name[:-3] if name.endswith(".md") else name
-        m = re.match(r"(\d+)/(\d+)$", progress)
-        t.append(short[:18].ljust(18) + " ")
-        if m:
-            done, total = int(m.group(1)), int(m.group(2))
-            fill = round(8 * done / total) if total else 0
-            bar = "▓" * fill + "░" * (8 - fill)
-            t.append(bar, style="green" if done == total else "yellow")
-            t.append(f" {done}/{total}", style="dim")
-        else:
-            t.append("—", style="dim")
+        t.append("▾ " if expanded else "▸ ", style="dim")
+        t.append(short[:24])
+        t.append(f"  {done}/{total}", style="dim")
         return t
 
-    def scroll_to_todo(self, name: str) -> None:
-        card = self._todo_cards.get(name)
-        if card is not None:
-            try:
-                card.scroll_visible()
-            except Exception:
-                pass
+    def expand_todo(self, name: str) -> None:
+        """Expand one todo list in the sidebar, collapsing the others."""
+        if name in self._todo_data:
+            self._todo_expanded = name
+            self._refresh_sidebar()
+
+    def cycle_todo(self, delta: int) -> None:
+        """Keyboard: [ / ] moves the expanded list."""
+        names = sorted(self._todo_data)
+        if not names:
+            return
+        try:
+            i = names.index(self._todo_expanded or "")
+        except ValueError:
+            i = 0 if delta > 0 else -1
+        self.expand_todo(names[(i + delta) % len(names)])
 
     def action_toggle_sidebar(self) -> None:
         self._sidebar_manual_hide = not self._sidebar_manual_hide
         self._refresh_sidebar()
+        if not self._sidebar_manual_hide and not self._sidebar_fits():
+            self.notify("todo sidebar hidden — widen the terminal to show it")
 
     def _list_todos(self) -> None:
-        if not self._todo_cards:
+        if not self._todo_data:
             self.notify("no todo lists — write markdown to ~/.muse/todos/")
             return
-        lines = ["todo lists:"]
-        for name in sorted(self._todo_cards):
-            card = self._todo_cards[name]
-            lines.append(f"  {name} · {card.progress_text or '?'}")
-        self.task_list.mount(Static("\n".join(lines), classes="help-card"))
-        self.task_list.scroll_end(animate=False)
+        self._sidebar_manual_hide = False
+        self._refresh_sidebar()
+        parts = [f"{n} · {r['done']}/{r['total']}"
+                 for n, r in sorted(self._todo_data.items())]
+        self.notify("todos (sidebar): " + "   ".join(parts))
 
     def _list_skills(self) -> None:
         skills = list_skills()
@@ -1423,7 +1470,7 @@ class MuseCliApp(App):
                               if f.endswith(".jsonl"))
         except OSError:
             sessions = []
-        todos = sorted(self._todo_cards)
+        todos = sorted(self._todo_data)
         try:
             skills = [s["name"] for s in list_skills()]
         except Exception:
@@ -1742,12 +1789,13 @@ class MuseCliApp(App):
                 self._list_todos()
             else:
                 key = arg if arg.endswith(".md") else arg + ".md"
-                card = self._todo_cards.get(key)
-                if card is None:
+                rec = self._todo_data.get(key)
+                if rec is None:
                     self.notify(f"no todo list: {arg} (see /todos)")
                 else:
-                    card.scroll_visible()
-                    self.notify(f"todo: {key} · {card.progress_text}")
+                    self._sidebar_manual_hide = False
+                    self.expand_todo(key)
+                    self.notify(f"todo: {key} · {rec['done']}/{rec['total']}")
         elif name == "skills":
             self._list_skills()
         elif name == "skill":
@@ -1845,6 +1893,21 @@ class MuseCliApp(App):
         self.task_list.mount(Static("\n".join(lines), classes="help-card"))
         self.task_list.scroll_end(animate=False)
 
+    def _esc_tap(self, blur: bool = True) -> None:
+        """One Esc press toward the double-Esc failsafe.
+
+        The first tap records the time (and leaves the input box); a
+        second tap within DOUBLE_ESC_WINDOW stops everything running.
+        """
+        now = time.monotonic()
+        if now - self._last_esc < self.DOUBLE_ESC_WINDOW:
+            self._last_esc = 0.0
+            self.action_stop_all()
+        else:
+            self._last_esc = now
+            if blur and isinstance(self.focused, Input):
+                self.cmd_input.blur()
+
     def on_key(self, event: events.Key) -> None:
         """Keyboard-first navigation.
 
@@ -1853,20 +1916,17 @@ class MuseCliApp(App):
         the input so the keys work; / jumps back into it; j/k move the
         selection between task cards.
         """
+        if CommandPalette.is_open(self):
+            # The command palette owns the keyboard while open: our
+            # global keys (notably Esc, which the palette binds to close
+            # itself, and ↑/↓) must not steal from it.
+            return
         in_input = isinstance(self.focused, Input)
         if event.key == "escape":
             # Esc with the completion dropdown open is consumed by CmdInput
-            # (closes the dropdown) and never reaches here.
-            now = time.monotonic()
-            if now - self._last_esc < self.DOUBLE_ESC_WINDOW:
-                self._last_esc = 0.0
-                self.action_stop_all()
-                event.prevent_default()
-            else:
-                self._last_esc = now
-                if in_input:
-                    self.cmd_input.blur()
-                event.prevent_default()
+            # (closes the dropdown, counts the press) and never reaches here.
+            self._esc_tap()
+            event.prevent_default()
         elif event.key == "shift+tab" and not in_input:
             # CmdInput handles this when the box is focused.
             self.action_toggle_auto_approve()
@@ -1888,6 +1948,11 @@ class MuseCliApp(App):
             event.prevent_default()
         elif event.key in ("k", "up") and not in_input:
             self._move_selection(-1)
+            event.prevent_default()
+        elif event.key in ("left_square_bracket", "right_square_bracket") \
+                and not in_input:
+            # cycle the expanded todo list in the sidebar
+            self.cycle_todo(1 if event.key == "right_square_bracket" else -1)
             event.prevent_default()
 
     def _move_selection(self, delta: int) -> None:
@@ -2197,7 +2262,7 @@ class MuseCliApp(App):
             # Mini todo summary on the right, above the message box.
             done, total = self._todo_counts()
             self.activity_right.update(
-                Text(f"☑ {done}/{total}", style="dim") if total else "")
+                Text(f"☑ {done}/{total} todos", style="dim") if total else "")
         except AttributeError:
             pass
 
