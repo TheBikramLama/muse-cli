@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shlex
 import subprocess
 import time
@@ -28,7 +29,8 @@ from textual.widgets import Footer, Header, Input, Static, TextArea
 
 from .bridge import Bridge
 from .config import load_settings
-from .paths import PAUSED_PATH, SCRIPTS_DIR, SESSIONS_DIR, SETTINGS_PATH
+from .paths import (EXPORTS_DIR, INPUT_HISTORY_PATH, PAUSED_PATH, SCRIPTS_DIR,
+                   SESSIONS_DIR, SETTINGS_PATH, ensure_dirs)
 from .protocol import cancel, submit
 from .sessions import load_recent, log_task, new_session
 
@@ -60,6 +62,7 @@ Keys (when the input box is not focused — press Esc to leave it):
   a   approve the selected task (when awaiting approval)
   d   deny the selected task (when awaiting approval)
   y   copy the selected task's detail to the clipboard
+  s   save the selected task's detail + output to ~/.muse/exports/
   g   jump to the newest task
   q   quit
 
@@ -305,6 +308,7 @@ class MuseCliApp(App):
         ("d", "deny_task", "Deny"),
         ("p", "toggle_pause", "Pause"),
         ("r", "retry_task", "Retry"),
+        ("s", "save_output", "Save"),
         ("y", "copy_task", "Copy"),
         ("g", "scroll_bottom", "Bottom"),
     ]
@@ -320,6 +324,9 @@ class MuseCliApp(App):
         self._last_chunk: dict[str, float] = {}
         self._muse_running = 0
         self._bridge: Bridge | None = None
+        self._history: list[str] = self._load_history()
+        self._hist_idx: int | None = None
+        self._hist_draft = ""
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -448,6 +455,8 @@ class MuseCliApp(App):
             card.finish(res)
         log_task(self.session_id, res)
         self.task_list.scroll_end(animate=False)
+        if self.settings.get("tui", {}).get("notify_on_done"):
+            self._notify_done(res)
 
     def _tick(self) -> None:
         self._frame += 1
@@ -460,6 +469,7 @@ class MuseCliApp(App):
         event.input.value = ""
         if not text:
             return
+        self._hist_push(text)
         if text.startswith("/"):
             self._slash(text)
             return
@@ -563,6 +573,12 @@ class MuseCliApp(App):
         if event.key == "escape" and in_input:
             self.query_one("#cmd", Input).blur()
             event.prevent_default()
+        elif event.key == "up" and in_input:
+            self._hist_move(-1)
+            event.prevent_default()
+        elif event.key == "down" and in_input:
+            self._hist_move(1)
+            event.prevent_default()
         elif event.key == "slash" and not in_input:
             self.query_one("#cmd", Input).focus()
             event.prevent_default()
@@ -587,6 +603,40 @@ class MuseCliApp(App):
         card = self.cards.get(self.focused_rid)
         if card is not None:
             card.scroll_visible()
+
+    # -- input history (↑/↓ in the box) --
+    @staticmethod
+    def _load_history() -> list[str]:
+        try:
+            with open(INPUT_HISTORY_PATH) as f:
+                h = json.load(f)
+            return [x for x in h if isinstance(x, str)][-200:]
+        except (OSError, ValueError):
+            return []
+
+    def _hist_push(self, text: str) -> None:
+        if not (self._history and self._history[-1] == text):
+            self._history.append(text)
+            self._history = self._history[-200:]
+            try:
+                with open(INPUT_HISTORY_PATH, "w") as f:
+                    json.dump(self._history, f)
+            except OSError:
+                pass
+        self._hist_idx = None
+
+    def _hist_move(self, delta: int) -> None:
+        if not self._history:
+            return
+        inp = self.query_one("#cmd", Input)
+        if self._hist_idx is None:
+            self._hist_draft = inp.value
+            self._hist_idx = len(self._history)
+        self._hist_idx = max(0, min(len(self._history), self._hist_idx + delta))
+        if self._hist_idx < len(self._history):
+            inp.value = self._history[self._hist_idx]
+        else:
+            inp.value = self._hist_draft
 
     # -- selection, keybindings, status --
     def refresh_selection(self) -> None:
@@ -686,6 +736,33 @@ class MuseCliApp(App):
             self.notify("copied to clipboard")
         else:
             self.notify("copy failed")
+
+    def action_save_output(self) -> None:
+        card = self.cards.get(self.focused_rid or "")
+        if card is None or (not card.done and card.result is None):
+            self.notify("nothing to save yet")
+            return
+        ensure_dirs()
+        path = os.path.join(EXPORTS_DIR, f"{card.rid}.md")
+        try:
+            with open(path, "w") as f:
+                f.write(f"# {card.task_text}\n\n{card.detail_text()}\n")
+        except OSError:
+            self.notify("could not save")
+            return
+        self.notify(f"saved: {path}")
+
+    def _notify_done(self, res: dict) -> None:
+        try:
+            msg = (f"{res.get('task') or 'task'}: "
+                   f"{res.get('summary') or res.get('error') or 'done'}")
+            msg = msg.replace("\\", "\\\\").replace('"', '\\"')[:200]
+            subprocess.run(
+                ["osascript", "-e",
+                 f'display notification "{msg}" with title "muse-cli"'],
+                timeout=5, capture_output=True)
+        except Exception:
+            pass
 
     def action_scroll_bottom(self) -> None:
         self.task_list.scroll_end(animate=False)

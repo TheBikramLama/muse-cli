@@ -25,6 +25,7 @@ DEFAULTS: dict = {
     "tui": {
         "poll_interval": 0.5,
         "history_limit": 50,
+        "notify_on_done": False,  # macOS notification when any task finishes
     },
 }
 

@@ -74,10 +74,17 @@ Guardrails (live-editable in `~/.muse/settings.json`): executable allowlist, all
 | `a` | approve the selected task (when awaiting approval) |
 | `d` | deny the selected task (when awaiting approval) |
 | `y` | copy the selected task's detail to the clipboard |
+| `s` | save the selected task's detail to `~/.muse/exports/` |
 | `g` | jump to the newest task |
 | `q` | quit |
 
 Slash commands in the input box: `/cd <dir>`, `/run <script>`, `/scripts`, `/settings`, `/sessions`, `/clear`, `/help`, `/quit`. Aliases: `/exit` = `/quit`, `/q` = `/quit`, `/h` = `/help`, `/resume` = `/sessions`. Click a card to select it. The detail pane is a read-only text area, so you can also drag-select text with the mouse.
+
+## Input / output polish
+
+- ↑/↓ in the input box walks command history (persisted in `~/.muse/input_history`).
+- `s` saves a task's detail + full output to `~/.muse/exports/<id>.md`.
+- Set `tui.notify_on_done: true` in `~/.muse/settings.json` for a macOS notification whenever a task finishes.
 
 ## Queue controls
 
