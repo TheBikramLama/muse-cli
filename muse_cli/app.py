@@ -1,4 +1,4 @@
-"""muse-cli TUI — full-screen task bridge.
+"""muse-cli TUI — full-screen companion for the Muse app's terminal work.
 
 - Scrollable task cards: each card is a unit of work (a `task` summary),
   not just a command line.
@@ -7,8 +7,11 @@
 - Commands stay hidden; `c` reveals a task's commands + full output.
 - Every finished task carries a one-line summary of what it did.
 - Bottom input box: type a command any time — while a task runs or after.
+- `x` cancels the selected (or currently running) task.
 - `y` copies a task's detail to the clipboard; the detail pane is a
   read-only TextArea so you can also drag-select text with the mouse.
+- Status bar shows a live Muse link indicator: green "working" whenever the
+  Muse app is routing work through the bridge, grey "idle" otherwise.
 """
 from __future__ import annotations
 
@@ -17,6 +20,7 @@ import shlex
 import subprocess
 import time
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.widgets import Footer, Header, Input, Static, TextArea
@@ -24,7 +28,7 @@ from textual.widgets import Footer, Header, Input, Static, TextArea
 from .bridge import Bridge
 from .config import load_settings
 from .paths import SCRIPTS_DIR, SETTINGS_PATH
-from .protocol import submit
+from .protocol import cancel, submit
 from .sessions import load_recent, log_task, new_session
 
 SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -42,6 +46,7 @@ Slash commands (type in the box below):
 
 Keys:
   c   show/hide the selected task's commands + full output
+  x   cancel the selected (or currently running) task
   y   copy the selected task's detail to the clipboard
   g   jump to the newest task
   q   quit
@@ -205,6 +210,7 @@ class MuseCliApp(App):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("c", "toggle_detail", "Commands"),
+        ("x", "cancel_task", "Cancel"),
         ("y", "copy_task", "Copy"),
         ("g", "scroll_bottom", "Bottom"),
     ]
@@ -218,6 +224,7 @@ class MuseCliApp(App):
         self.focused_rid: str | None = None
         self._frame = 0
         self._last_chunk: dict[str, float] = {}
+        self._muse_running = 0
         self._bridge: Bridge | None = None
 
     def compose(self) -> ComposeResult:
@@ -280,6 +287,9 @@ class MuseCliApp(App):
     # -- UI-thread handlers --
     def _on_start(self, req: dict) -> None:
         rid = req["id"]
+        if req.get("source") == "muse":
+            self._muse_running += 1
+            self._refresh_statusbar()
         card = self.cards.get(rid)
         if card is None:
             # Submitted externally (e.g. by Muse dropping a file in the queue).
@@ -298,6 +308,9 @@ class MuseCliApp(App):
             card.push_chunk(line)
 
     def _on_result(self, res: dict) -> None:
+        if res.get("source") == "muse":
+            self._muse_running = max(0, self._muse_running - 1)
+            self._refresh_statusbar()
         card = self.cards.get(res["id"])
         if card is not None:
             card.finish(res)
@@ -395,6 +408,17 @@ class MuseCliApp(App):
         assert card._detail is not None
         self.notify("commands shown" if card._detail.display else "commands hidden")
 
+    def action_cancel_task(self) -> None:
+        card = self.cards.get(self.focused_rid or "")
+        if card is None or card.done:
+            running = [c for c in self.cards.values() if not c.done]
+            card = running[0] if running else None
+        if card is None:
+            self.notify("nothing running")
+            return
+        cancel(card.rid)
+        self.notify(f"cancelling: {card.task_text[:40]}")
+
     def action_copy_task(self) -> None:
         card = self.cards.get(self.focused_rid or "")
         if card is None:
@@ -409,5 +433,16 @@ class MuseCliApp(App):
         self.task_list.scroll_end(animate=False)
 
     def _refresh_statusbar(self, extra: str = "") -> None:
-        base = f"muse-cli · cwd: {self.session_cwd} · ~/.muse"
-        self.statusbar.update(f"{base} · {extra}" if extra else base)
+        t = Text()
+        t.append("muse-cli · cwd: ")
+        t.append(self.session_cwd)
+        t.append(" · bridge ")
+        t.append("●", style="green")
+        t.append(" · muse ")
+        if self._muse_running:
+            t.append("● working", style="green")
+        else:
+            t.append("○ idle", style="dim")
+        if extra:
+            t.append(f" · {extra}")
+        self.statusbar.update(t)

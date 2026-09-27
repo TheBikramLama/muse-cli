@@ -69,7 +69,7 @@ def _cap(text: str, limit: int) -> tuple[str, bool]:
     return text, False
 
 
-def run_request(req: dict, settings: dict, on_chunk=None) -> dict:
+def run_request(req: dict, settings: dict, on_chunk=None, on_proc=None) -> dict:
     rid = req.get("id", "?")
     started = time.time()
 
@@ -106,6 +106,12 @@ def run_request(req: dict, settings: dict, on_chunk=None) -> dict:
         return _fail(rid, f"executable not found: {cmd[0]}", started, req)
     except Exception as e:
         return _fail(rid, f"runner error: {e}", started, req)
+
+    if on_proc:
+        try:
+            on_proc(proc)
+        except Exception:
+            pass
 
     out_lines: list[str] = []
     err_lines: list[str] = []

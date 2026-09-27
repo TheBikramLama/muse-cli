@@ -20,7 +20,7 @@ import os
 import time
 import uuid
 
-from .paths import QUEUE_DIR, RESULTS_DIR, ensure_dirs
+from .paths import CANCEL_DIR, QUEUE_DIR, RESULTS_DIR, ensure_dirs
 
 
 def new_id() -> str:
@@ -79,3 +79,9 @@ def take_result(rid: str) -> dict | None:
         except OSError:
             pass
     return res
+
+
+def cancel(rid: str) -> None:
+    """Request cancellation of a running (or queued) task."""
+    ensure_dirs()
+    open(os.path.join(CANCEL_DIR, rid), "w").close()

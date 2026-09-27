@@ -6,6 +6,10 @@ Used two ways:
   - Embedded: the TUI starts a Bridge in a background thread and wires
     on_start / on_chunk / on_result callbacks to live widgets.
 
+Cancellation: drop an empty file named <task-id> into ~/.muse/cancel/
+(the TUI does this when you press `x`). The bridge kills the process and
+reports the task as cancelled.
+
 Settings are reloaded every loop so editing ~/.muse/settings.json applies live.
 """
 from __future__ import annotations
@@ -16,7 +20,7 @@ import threading
 import time
 
 from .config import load_settings
-from .paths import QUEUE_DIR, ensure_dirs
+from .paths import CANCEL_DIR, QUEUE_DIR, ensure_dirs
 from .protocol import write_result
 from .runner import run_request
 
@@ -30,6 +34,35 @@ def _rm(path: str) -> None:
         pass
 
 
+def _cancelled_result(req: dict) -> dict:
+    now = time.time()
+    return {
+        "id": req.get("id", "?"),
+        "ok": False,
+        "error": "cancelled",
+        "exit": None,
+        "stdout": "",
+        "stderr": "",
+        "truncated": False,
+        "summary": "cancelled",
+        "started_at": now,
+        "ended_at": now,
+        "duration_s": 0,
+        "task": req.get("task", ""),
+        "source": req.get("source", "muse"),
+        "cmd": req.get("cmd", []),
+        "cwd": req.get("cwd"),
+    }
+
+
+def _call(cb, *args) -> None:
+    if cb:
+        try:
+            cb(*args)
+        except Exception:
+            pass
+
+
 class Bridge:
     def __init__(self, settings: dict, on_start=None, on_chunk=None, on_result=None):
         self.settings = settings
@@ -39,6 +72,8 @@ class Bridge:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._attempts: dict[str, int] = {}
+        self._procs: dict[str, object] = {}
+        self._cancelled: set[str] = set()
 
     # -- lifecycle --
     def start(self) -> None:
@@ -61,9 +96,26 @@ class Bridge:
                 self.settings = load_settings()
             except Exception:
                 pass
+            self._check_cancels()
             self._drain()
             poll = self.settings.get("tui", {}).get("poll_interval", 0.5)
             time.sleep(poll)
+
+    def _check_cancels(self) -> None:
+        ensure_dirs()
+        try:
+            names = os.listdir(CANCEL_DIR)
+        except OSError:
+            return
+        for rid in names:
+            _rm(os.path.join(CANCEL_DIR, rid))
+            self._cancelled.add(rid)
+            proc = self._procs.get(rid)
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
     def _drain(self) -> None:
         ensure_dirs()
@@ -85,12 +137,10 @@ class Bridge:
                 n = self._attempts.get(rid, 0) + 1
                 self._attempts[rid] = n
                 if n >= MAX_PARSE_ATTEMPTS:
-                    write_result({
-                        "id": rid, "ok": False, "error": "could not read request file",
-                        "exit": None, "stdout": "", "stderr": "", "truncated": False,
-                        "summary": "could not read request file",
-                        "task": "", "source": "muse", "cmd": [], "cwd": None,
-                    })
+                    res = _cancelled_result({"id": rid})
+                    res["error"] = "could not read request file"
+                    res["summary"] = "could not read request file"
+                    write_result(res)
                     self._attempts.pop(rid, None)
                     _rm(path)
                 continue
@@ -102,26 +152,35 @@ class Bridge:
 
     def _run_one(self, req: dict) -> None:
         rid = req.get("id", "?")
-        if self.on_start:
-            try:
-                self.on_start(req)
-            except Exception:
-                pass
+        if rid in self._cancelled:
+            # Cancelled while queued: never start it.
+            self._cancelled.discard(rid)
+            res = _cancelled_result(req)
+            write_result(res)
+            _call(self.on_result, res)
+            return
+
+        _call(self.on_start, req)
 
         def _chunk(line: str) -> None:
-            if self.on_chunk:
-                try:
-                    self.on_chunk(rid, line)
-                except Exception:
-                    pass
+            _call(self.on_chunk, rid, line)
 
-        res = run_request(req, self.settings, on_chunk=_chunk)
+        def _got_proc(proc) -> None:
+            self._procs[rid] = proc
+
+        try:
+            res = run_request(req, self.settings, on_chunk=_chunk, on_proc=_got_proc)
+        finally:
+            self._procs.pop(rid, None)
+
+        if rid in self._cancelled:
+            self._cancelled.discard(rid)
+            res["ok"] = False
+            res["error"] = "cancelled"
+            res["summary"] = "cancelled"
+            res["exit"] = None
         write_result(res)
-        if self.on_result:
-            try:
-                self.on_result(res)
-            except Exception:
-                pass
+        _call(self.on_result, res)
 
 
 def run_daemon() -> None:
