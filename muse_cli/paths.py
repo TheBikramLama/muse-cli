@@ -40,6 +40,13 @@ MESSAGES_DIR = os.path.join(MUSE_HOME, "messages")
 REPLIES_DIR = os.path.join(MUSE_HOME, "replies")
 TODOS_DIR = os.path.join(MUSE_HOME, "todos")
 SEEN_PATH = os.path.join(MUSE_HOME, ".seen_replies")  # reply ids already shown (json list)
+# Written by the Muse-side inbox watcher on every run: {"at", "ok", "state",
+# "mid", "error"}. The TUI reads it for the watcher health segment and the
+# "Muse is writing…" message state. A stale/missing file means the watcher
+# is down — that absence is the signal.
+WATCHER_JSON = os.path.join(MUSE_HOME, "watcher.json")
+# Heartbeat older than this counts as a silent watcher (job runs every ~2m).
+WATCHER_STALE_S = 300
 
 ALL_DIRS = [QUEUE_DIR, RESULTS_DIR, SESSIONS_DIR, SKILLS_DIR, SCRIPTS_DIR,
             CANCEL_DIR, APPROVAL_DIR, EXPORTS_DIR,

@@ -34,6 +34,7 @@ from .config import load_settings, save_settings
 from .paths import (DEFAULT_SESSION, EXPORTS_DIR, INPUT_HISTORY_PATH,
                    MESSAGES_DIR, PAUSED_PATH, REPLIES_DIR, SCRIPTS_DIR,
                    SEEN_PATH, SESSIONS_DIR, SETTINGS_PATH, TODOS_DIR,
+                   WATCHER_JSON, WATCHER_STALE_S,
                    ensure_dirs, valid_session)
 from .protocol import cancel, new_id, submit
 from .runner import check_cwd
@@ -296,7 +297,12 @@ class TaskCard(Vertical):
 
 
 class MessageCard(Vertical):
-    """A chat message — yours (outgoing) or Muse's reply (incoming)."""
+    """A chat message — yours (outgoing) or Muse's reply (incoming).
+
+    Outgoing cards carry a live status: "sent · waiting for Muse" →
+    "Muse is writing…" → "replied ✓", driven by the watcher heartbeat
+    (~/.muse/watcher.json) and the reply file.
+    """
 
     def __init__(self, mid: str, text: str, incoming: bool,
                  at: float | None = None) -> None:
@@ -305,15 +311,29 @@ class MessageCard(Vertical):
         self.incoming = incoming
         self.at = at or time.time()
         self._text = text
+        self._status_text = ""
 
     def compose(self) -> ComposeResult:
         with Horizontal(classes="task-head"):
             yield Static("💬" if self.incoming else "🗨", classes="ticon done")
             who = "Muse" if self.incoming else "you"
             yield Static(who, classes="task-title")
+            if not self.incoming:
+                self.status = Static(self._status_text, classes="task-src")
+                yield self.status
             yield Static(time.strftime("%H:%M", time.localtime(self.at)),
                          classes="task-src")
         yield Markdown(self._text, classes="msg-body")
+
+    def set_status(self, text: str) -> None:
+        """Update the outgoing status line (no-op for incoming cards)."""
+        if self.incoming or text == self._status_text:
+            return
+        self._status_text = text
+        try:
+            self.status.update(text)
+        except AttributeError:
+            pass  # not composed yet; compose() picks up _status_text
 
 
 class TodoCard(Vertical):
@@ -473,6 +493,11 @@ class MuseCliApp(App):
         self._seen_replies: set[str] = self._load_seen()
         self._poll_n = 0
         self._todo_cards: dict[str, TodoCard] = {}
+        # Watcher visibility: last ~/.muse/watcher.json payload (None = never
+        # seen) plus outgoing message cards by mid for status updates.
+        self._watcher: dict | None = None
+        self._watcher_mtime = 0.0
+        self._msg_cards: dict[str, MessageCard] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -634,6 +659,9 @@ class MuseCliApp(App):
         if self._poll_n % 10 == 0:  # ~1s
             self._poll_replies()
             self._poll_todos()
+            self._poll_watcher()
+        if self._poll_n % 100 == 0:  # ~10s: staleness is time-based, so the
+            self._refresh_statusbar()  # watcher segment needs a periodic nudge
 
     # -- messages: ~/.muse/messages (you -> Muse) / ~/.muse/replies (Muse -> you)
     @staticmethod
@@ -681,10 +709,67 @@ class MuseCliApp(App):
             self.task_list.mount(card)
             self.task_list.scroll_end(animate=False)
             self._seen_replies.add(mid)
+            out = self._msg_cards.get(mid)
+            if out is not None:
+                out.set_status("replied ✓")
             new = True
             self.notify("💬 reply from Muse")
         if new:
             self._save_seen()
+
+    # -- watcher visibility: ~/.muse/watcher.json heartbeat --
+    def _poll_watcher(self) -> None:
+        """Read the inbox-watcher's heartbeat; staleness itself is the
+        down signal (a dead watcher can't write anything)."""
+        try:
+            mtime = os.path.getmtime(WATCHER_JSON)
+        except OSError:
+            if self._watcher is not None or self._watcher_mtime:
+                self._watcher, self._watcher_mtime = None, 0.0
+                self._refresh_statusbar()
+                self._refresh_msg_states()
+            return
+        if mtime != self._watcher_mtime:
+            self._watcher_mtime = mtime
+            try:
+                with open(WATCHER_JSON) as f:
+                    payload = json.load(f)
+                self._watcher = payload if isinstance(payload, dict) else None
+            except (OSError, ValueError):
+                self._watcher = None
+            self._refresh_statusbar()
+        self._refresh_msg_states()
+
+    def _watcher_segment(self) -> tuple[str, str]:
+        """(text, style) for the status bar's watcher health indicator."""
+        w = self._watcher
+        if w is None:
+            return "○ not seen", "dim"
+        if not w.get("ok", True):
+            return "⚠ error", "red"
+        try:
+            age = time.time() - float(w.get("at") or 0)
+        except (TypeError, ValueError):
+            age = float("inf")
+        if age > WATCHER_STALE_S:
+            mins = int(age // 60)
+            return f"⚠ silent {mins}m", "yellow"
+        if w.get("state") == "writing":
+            return "✎ writing…", "cyan"
+        return "●", "green"
+
+    def _msg_status(self, mid: str) -> str:
+        if os.path.exists(os.path.join(REPLIES_DIR, mid + ".json")):
+            return "replied ✓"
+        w = self._watcher
+        if (isinstance(w, dict) and w.get("state") == "writing"
+                and w.get("mid") == mid):
+            return "Muse is writing…"
+        return "sent · waiting for Muse"
+
+    def _refresh_msg_states(self) -> None:
+        for mid, card in self._msg_cards.items():
+            card.set_status(self._msg_status(mid))
 
     # -- todos: ~/.muse/todos/*.md watched live --
     def _poll_todos(self) -> None:
@@ -805,7 +890,11 @@ class MuseCliApp(App):
         for at, incoming, mid, text in items[-30:]:
             if incoming:
                 self._seen_replies.add(mid)
-            self.task_list.mount(MessageCard(mid, text, incoming, at))
+            card = MessageCard(mid, text, incoming, at)
+            if not incoming:
+                self._msg_cards[mid] = card
+                card.set_status(self._msg_status(mid))
+            self.task_list.mount(card)
         if items:
             self._save_seen()
 
@@ -990,6 +1079,8 @@ class MuseCliApp(App):
             self.notify("could not send message")
             return
         card = MessageCard(mid, text, incoming=False, at=payload["at"])
+        self._msg_cards[mid] = card
+        card.set_status(self._msg_status(mid))
         self.task_list.mount(card)
         self.task_list.scroll_end(animate=False)
         self.notify("✉ sent to Muse — replies appear here")
@@ -1388,6 +1479,9 @@ class MuseCliApp(App):
             t.append("● working", style="green")
         else:
             t.append("○ idle", style="dim")
+        wtext, wstyle = self._watcher_segment()
+        t.append(" · watcher ")
+        t.append(wtext, style=wstyle)
         active, waiting = self._task_counts()
         if active:
             t.append(f" · {active} active", style="cyan")

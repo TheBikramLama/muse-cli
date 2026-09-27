@@ -6,7 +6,7 @@ A full-screen TUI terminal bridge. Two-way communication between Muse and your M
 - **You → Mac:** type in the TUI input box any time — mid-task or after — and watch it run live.
 - **Talk to Muse:** plain text in the input box goes to the Muse app as a message; its replies render as Markdown cards right in the feed.
 - **Task cards, not command spam:** each unit of work shows a human summary with a live spinner, elapsed time, and a streaming output tail that updates *in place*. Commands stay hidden until you press `c`; every finished task carries a one-line summary of what it did.
-- **Live link:** the status bar shows whether the Muse app is routing work through the bridge (● working / ○ idle). Press `x` to cancel a running or queued task.
+- **Live link:** the status bar shows whether the Muse app is routing work through the bridge (● working / ○ idle) and whether the inbox watcher answering your messages is alive (`watcher ●` fresh / `⚠ silent` stale / `⚠ error`). Press `x` to cancel a running or queued task.
 
 Replaces the old `muse-runner.py` (kept under `legacy/` for reference). Unlike the old runner, it is not locked to one folder — commands may run anywhere under `~` by default (configurable).
 
@@ -63,6 +63,7 @@ Guardrails (live-editable in `~/.muse/settings.json`): executable allowlist, all
 ├── approval/       # parked approval requests
 ├── messages/       # your plain-text messages to Muse
 ├── replies/        # Muse's replies, rendered as cards
+├── watcher.json    # inbox-watcher heartbeat (liveness for the TUI)
 ├── todos/          # live Markdown checklists from Muse
 ├── sessions/       # JSONL history, one file per app run
 ├── skills/         # your skills (each in <name>/SKILL.md)
@@ -142,7 +143,7 @@ The input box routes on its first character:
 
 - `/help` — slash commands (see the TUI table above).
 - `!ls -la` — runs a shell command via `bash -lc` in a task card: streaming, cancellable with `x`, cwd-guardrailed, and logged. Output is capped (`max_output_bytes`, default 256 KB — over-long output is truncated with a note), and a real deadline is enforced: a hung command is killed at `timeout` seconds instead of hanging the bridge.
-- anything else — sends a message to Muse. It lands in `~/.muse/messages/<id>.json`; Muse's replies are polled from `~/.muse/replies/` about once a second and rendered as Markdown cards. Recent messages are restored at startup.
+- anything else — sends a message to Muse. It lands in `~/.muse/messages/<id>.json`; Muse's replies are polled from `~/.muse/replies/` about once a second and rendered as Markdown cards. Recent messages are restored at startup. Each outgoing message card shows its state: `sent · waiting for Muse` → `Muse is writing…` → `replied ✓`.
 
 ## Todo lists
 
@@ -166,6 +167,8 @@ Task requests can carry `"skills": ["name", …]`; the card shows a `⚙` badge 
 ## Muse inbox watcher
 
 Plain-text messages only become a conversation if something on the Muse side reads them. A scheduled job (every ~2 minutes) watches `~/.muse/messages/`, treats each new file as your instruction, does the work — via the same `~/.muse/queue/` bridge when it needs your Mac — and writes a Markdown reply to `~/.muse/replies/<id>.json`, which the TUI renders as a card. Each message is answered exactly once (processed IDs are tracked); your outgoing files are kept so the startup history view still works. Replies echo the message's `"session"` tag so they land in the right window.
+
+The watcher also writes a heartbeat to `~/.muse/watcher.json` on every run (`at`, `ok`, `state` = `idle`/`writing`, `mid`, `error`). The TUI reads it for the status-bar watcher segment: `●` fresh, `✎ writing…` while it answers, `⚠ silent Nm` when no heartbeat arrived for over 5 minutes, `⚠ error` on a recorded failure, `○ not seen` before the first run. A dead watcher can't write anything, so a stale heartbeat is itself the down signal — that's how the TUI tells "no reply yet" apart from "nobody's listening".
 
 ## Roadmap ideas
 
