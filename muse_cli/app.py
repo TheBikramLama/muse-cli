@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import selectors
 import subprocess
 import threading
 import time
@@ -829,6 +830,10 @@ class MuseCliApp(App):
 
         def _run() -> None:
             t0 = time.time()
+            timeout = max(1, min(int(self.settings.get("default_timeout", 120)),
+                                 self.settings.get("max_timeout", 1500)))
+            max_out = self.settings.get("max_output_bytes", 256 * 1024)
+            deadline = t0 + timeout
             try:
                 proc = subprocess.Popen(
                     ["bash", "-lc", cmd_text], cwd=cwd,
@@ -844,27 +849,74 @@ class MuseCliApp(App):
                 return
             self._shell_procs[rid] = proc
             chunks: list[str] = []
+            total = 0
+            truncated = False
+            noted = False
+            reason = ""
+            sel = selectors.DefaultSelector()
             try:
                 assert proc.stdout is not None
-                for line in proc.stdout:
-                    chunks.append(line)
-                    self.call_from_thread(self._shell_chunk, rid, line)
-                proc.wait(timeout=self.settings.get("default_timeout", 120))
-                exit_code = proc.returncode
-                error = ""
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                exit_code = None
-                error = "timed out"
-            except Exception as e:  # cancelled via x -> proc killed
-                exit_code = None
-                error = str(e) or "cancelled"
+                sel.register(proc.stdout, selectors.EVENT_READ)
+                pending = ""
+                while True:
+                    # Short polls keep the timeout and x-cancel responsive
+                    # even when the process is silent (nothing to unblock on).
+                    for key, _mask in sel.select(timeout=0.2):
+                        try:
+                            raw = os.read(key.fd, 65536)
+                        except OSError:
+                            raw = b""
+                        if not raw:
+                            continue
+                        pending += raw.decode("utf-8", errors="replace")
+                        lines = pending.split("\n")
+                        pending = lines.pop()
+                        for line in lines:
+                            if total < max_out:
+                                piece = line + "\n"
+                                chunks.append(piece)
+                                total += len(piece.encode("utf-8"))
+                                if total >= max_out:
+                                    truncated = True
+                                self.call_from_thread(self._shell_chunk, rid,
+                                                      piece)
+                            elif not noted:
+                                noted = True
+                                self.call_from_thread(
+                                    self._shell_chunk, rid,
+                                    f"… output truncated at {max_out} bytes …\n")
+                    if proc.poll() is not None:
+                        break
+                    if time.time() >= deadline:
+                        proc.kill()
+                        reason = f"command timed out after {timeout}s"
+                        break
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                sel.unregister(proc.stdout)
+                try:
+                    rest = proc.stdout.read() or ""
+                except Exception:
+                    rest = ""
+                for line in (pending + rest).split("\n"):
+                    if total < max_out:
+                        piece = line + "\n"
+                        chunks.append(piece)
+                        total += len(piece.encode("utf-8"))
+                truncated = truncated or total >= max_out
             finally:
+                sel.close()
                 self._shell_procs.pop(rid, None)
+            exit_code = proc.returncode
+            if not reason and exit_code is not None and exit_code < 0:
+                reason = "cancelled"  # killed from outside, e.g. via x
             res = self._shell_result(rid, task, cwd, cmd_text, t0,
-                                     ok=not error and exit_code == 0,
+                                     ok=not reason and exit_code == 0,
                                      exit_code=exit_code,
-                                     output="".join(chunks), error=error)
+                                     output="".join(chunks), error=reason,
+                                     truncated=truncated)
             try:
                 self.call_from_thread(self._shell_done, rid, res)
             except RuntimeError:
@@ -877,15 +929,17 @@ class MuseCliApp(App):
     @staticmethod
     def _shell_result(rid: str, task: str, cwd: str, cmd_text: str, t0: float,
                       ok: bool, exit_code: int | None,
-                      output: str, error: str) -> dict:
+                      output: str, error: str, truncated: bool = False) -> dict:
         ended = time.time()
         lines = [l for l in output.splitlines() if l.strip()]
         tail = lines[-1][:120] if lines else "no output"
         summary = (f"ok · {len(lines)} line(s) · {tail}" if ok
                    else f"{error or f'exit {exit_code}'}")
+        if truncated:
+            summary += " · truncated"
         return {
             "id": rid, "ok": ok, "exit": exit_code,
-            "stdout": output, "stderr": "", "truncated": False,
+            "stdout": output, "stderr": "", "truncated": truncated,
             "summary": summary, "started_at": t0, "ended_at": ended,
             "duration_s": round(ended - t0, 1), "task": task,
             "source": "shell", "cmd": ["bash", "-lc", cmd_text], "cwd": cwd,
