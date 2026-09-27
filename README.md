@@ -12,9 +12,8 @@ Replaces the old `muse-runner.py` (kept under `legacy/` for reference). Unlike t
 ## Quickstart
 
 ```bash
-pip install -r requirements.txt   # needs Textual
-./run.sh                          # or: python3 -m muse_cli
-python3 -m muse_cli --daemon      # bridge only, no TUI (plain stdout log)
+./run.sh                          # creates .venv on first run, then launches the TUI
+./run.sh --daemon                 # bridge only, no TUI (plain stdout log)
 ```
 
 ## How Muse uses it
@@ -72,7 +71,7 @@ Guardrails (live-editable in `~/.muse/settings.json`): executable allowlist, all
 | `g` | jump to the newest task |
 | `q` | quit |
 
-Slash commands in the input box: `/cd <dir>`, `/run <script>`, `/scripts`, `/settings`, `/clear`, `/help`, `/quit`. Click a card to select it. The detail pane is a read-only text area, so you can also drag-select text with the mouse.
+Slash commands in the input box: `/cd <dir>`, `/run <script>`, `/scripts`, `/settings`, `/sessions`, `/clear`, `/help`, `/quit`. Aliases: `/exit` = `/quit`, `/q` = `/quit`, `/h` = `/help`, `/resume` = `/sessions`. Click a card to select it. The detail pane is a read-only text area, so you can also drag-select text with the mouse.
 
 ## Roadmap ideas
 

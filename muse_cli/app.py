@@ -27,12 +27,14 @@ from textual.widgets import Footer, Header, Input, Static, TextArea
 
 from .bridge import Bridge
 from .config import load_settings
-from .paths import SCRIPTS_DIR, SETTINGS_PATH
+from .paths import SCRIPTS_DIR, SESSIONS_DIR, SETTINGS_PATH
 from .protocol import cancel, submit
 from .sessions import load_recent, log_task, new_session
 
 SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 CHUNK_THROTTLE_S = 0.15
+
+SLASH_ALIASES = {"exit": "quit", "q": "quit", "h": "help", "resume": "sessions"}
 
 HELP_TEXT = """\
 Slash commands (type in the box below):
@@ -40,9 +42,12 @@ Slash commands (type in the box below):
   /run <name>    run a script from ~/.muse/scripts/
   /scripts       list scripts in ~/.muse/scripts/
   /settings      show where settings.json lives
+  /sessions      list past sessions (most recent first)
   /clear         remove finished task cards
   /help          this help
   /quit          exit
+
+Aliases: /exit = /quit, /q = /quit, /h = /help, /resume = /sessions
 
 Keys:
   c   show/hide the selected task's commands + full output
@@ -69,7 +74,7 @@ class TaskCard(Vertical):
     """One unit of work."""
 
     def __init__(self, rid: str, task: str, source: str,
-                 cmd: list, cwd: str | None) -> None:
+                 cmd: list, cwd: str | None, restore_rec: dict | None = None) -> None:
         super().__init__(classes="task-card")
         self.rid = rid
         self.task_text = task or "(no description)"
@@ -81,6 +86,11 @@ class TaskCard(Vertical):
         self.result: dict | None = None
         self._tail: list[str] = []
         self._detail: TextArea | None = None
+        # Mounting is async: compose() hasn't run until on_mount fires, so
+        # anything touching composed widgets is deferred/guarded via these.
+        self._composed = False
+        self._restore_rec = restore_rec
+        self._pending_result: dict | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(classes="task-head"):
@@ -99,11 +109,25 @@ class TaskCard(Vertical):
             app.focused_rid = self.rid
             app.refresh_selection()
 
+    def on_mount(self) -> None:
+        self._composed = True
+        if self._pending_result is not None:
+            res, self._pending_result = self._pending_result, None
+            self.finish(res)
+        elif self._restore_rec is not None:
+            rec, self._restore_rec = self._restore_rec, None
+            self.restore(rec)
+        elif not self.done:
+            self.live.update("starting…")
+
     # -- live updates (invoked on the UI thread via call_from_thread) --
     def mark_running(self) -> None:
-        self.live.update("starting…")
+        if self._composed:
+            self.live.update("starting…")
 
     def push_chunk(self, line: str) -> None:
+        if not self._composed:
+            return
         line = line.rstrip()
         if not line:
             return
@@ -112,12 +136,16 @@ class TaskCard(Vertical):
         self.live.update("\n".join(self._tail))
 
     def tick(self, frame: int) -> None:
-        if self.done:
+        if self.done or not self._composed:
             return
         self.icon.update(SPINNER[frame % len(SPINNER)])
         self.elapsed.update(f"{time.time() - self.t0:.0f}s")
 
     def finish(self, res: dict) -> None:
+        if not self._composed:
+            # Mount not processed yet (instant task); on_mount applies it.
+            self._pending_result = res
+            return
         self.done = True
         self.result = res
         ok = bool(res.get("ok")) and res.get("exit", 1) == 0
@@ -197,8 +225,8 @@ class MuseCliApp(App):
     .ticon.done { color: $success; }
     .ticon.failed { color: $error; }
     .task-title { width: 1fr; text-style: bold; }
-    .task-src { color: $text-muted; margin-left: 1; }
-    .task-elapsed { color: $text-muted; margin-left: 1; }
+    .task-src { width: auto; color: $text-muted; margin-left: 1; }
+    .task-elapsed { width: auto; color: $text-muted; margin-left: 1; }
     .live-line { color: $text-muted; height: auto; }
     .detail { height: 16; border-top: solid $surface-lighten-2; margin-top: 1; }
     .help-card {
@@ -241,10 +269,9 @@ class MuseCliApp(App):
         for rec in load_recent(self.settings.get("tui", {}).get("history_limit", 50)):
             card = TaskCard(rec.get("id", "?"), rec.get("task", ""),
                             rec.get("source", "muse"), rec.get("cmd", []),
-                            rec.get("cwd"))
+                            rec.get("cwd"), restore_rec=rec)
             self.cards[card.rid] = card
             self.task_list.mount(card)
-            card.restore(rec)
         self._bridge = Bridge(
             self.settings,
             on_start=self._cb_start,
@@ -348,7 +375,7 @@ class MuseCliApp(App):
 
     def _slash(self, text: str) -> None:
         parts = text[1:].split(None, 1)
-        name = parts[0].lower()
+        name = SLASH_ALIASES.get(parts[0].lower(), parts[0].lower())
         arg = parts[1] if len(parts) > 1 else ""
         if name == "cd":
             d = os.path.abspath(os.path.expanduser(arg or "~"))
@@ -387,10 +414,37 @@ class MuseCliApp(App):
             self.refresh_selection()
         elif name == "settings":
             self.notify(f"settings: {SETTINGS_PATH}")
+        elif name == "sessions":
+            self._list_sessions()
         elif name in ("quit", "q"):
             self.exit()
         else:
             self.notify(f"unknown command: /{name}  (try /help)")
+
+    def _list_sessions(self) -> None:
+        try:
+            files = sorted(
+                (f for f in os.listdir(SESSIONS_DIR) if f.endswith(".jsonl")),
+                key=lambda f: os.path.getmtime(os.path.join(SESSIONS_DIR, f)),
+                reverse=True,
+            )
+        except OSError:
+            files = []
+        if not files:
+            self.notify("no previous sessions")
+            return
+        lines = ["sessions (most recent first):"]
+        for f in files[:10]:
+            p = os.path.join(SESSIONS_DIR, f)
+            try:
+                with open(p) as fh:
+                    n = sum(1 for _ in fh)
+            except OSError:
+                n = 0
+            marker = "  ← current" if f.startswith(self.session_id) else ""
+            lines.append(f"  {f} · {n} task(s){marker}")
+        self.task_list.mount(Static("\n".join(lines), classes="help-card"))
+        self.task_list.scroll_end(animate=False)
 
     # -- selection, keybindings, status --
     def refresh_selection(self) -> None:
