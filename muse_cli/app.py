@@ -32,7 +32,7 @@ from .bridge import Bridge
 from .config import load_settings
 from .paths import (EXPORTS_DIR, INPUT_HISTORY_PATH, MESSAGES_DIR, PAUSED_PATH,
                    REPLIES_DIR, SCRIPTS_DIR, SEEN_PATH, SESSIONS_DIR,
-                   SETTINGS_PATH, ensure_dirs)
+                   SETTINGS_PATH, TODOS_DIR, ensure_dirs)
 from .protocol import cancel, new_id, submit
 from .runner import check_cwd
 from .sessions import load_recent, log_task, new_session
@@ -307,6 +307,75 @@ class MessageCard(Vertical):
         yield Markdown(self._text, classes="msg-body")
 
 
+class TodoCard(Vertical):
+    """A live markdown checklist from ~/.muse/todos/<name>.md.
+
+    The file is the source of truth: edit it (or let Muse edit it) and
+    the card re-renders with fresh checkboxes and n/m progress.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(classes="todo-card")
+        self.tname = name
+        self.path = os.path.join(TODOS_DIR, name)
+        self._mtime = 0.0
+        self._composed = False
+        self._pending_text: str | None = None
+        self.progress_text = ""
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="task-head"):
+            yield Static("☑", classes="ticon done")
+            title = self.tname[:-3] if self.tname.endswith(".md") else self.tname
+            yield Static(title, classes="task-title")
+            self.progress = Static("", classes="task-src")
+            yield self.progress
+        self.body = Markdown("", classes="msg-body")
+        yield self.body
+
+    def on_mount(self) -> None:
+        self._composed = True
+        if self._pending_text is not None:
+            text, self._pending_text = self._pending_text, None
+            self._apply_text(text)
+
+    def refresh_if_changed(self) -> bool:
+        """Re-render when the file changed. False when the file is gone."""
+        try:
+            mtime = os.path.getmtime(self.path)
+        except OSError:
+            return False
+        if mtime == self._mtime and self._composed:
+            return True
+        self._mtime = mtime
+        try:
+            with open(self.path) as f:
+                text = f.read()
+        except OSError:
+            return False
+        if not self._composed:
+            self._pending_text = text
+            return True
+        self._apply_text(text)
+        return True
+
+    def _apply_text(self, text: str) -> None:
+        done = len(re.findall(r"^\s*[-*]\s+\[x\]", text, re.M | re.I))
+        open_ = len(re.findall(r"^\s*[-*]\s+\[ \]", text, re.M))
+        total = done + open_
+        self.progress_text = f"{done}/{total}" if total else "empty"
+        if self._composed:
+            self.progress.update(self.progress_text)
+        # Real checkboxes regardless of the markdown renderer's task-list support.
+        pretty = re.sub(r"^(\s*[-*]\s+)\[ \]", r"\1☐", text, flags=re.M)
+        pretty = re.sub(r"^(\s*[-*]\s+)\[x\]", r"\1☑", pretty, flags=re.M | re.I)
+        if self._composed:
+            try:
+                self.body.update(pretty)
+            except Exception:
+                pass
+
+
 class MuseCliApp(App):
     TITLE = "muse-cli"
     CSS = """
@@ -350,6 +419,11 @@ class MuseCliApp(App):
     }
     .msg-card.incoming { border: solid $primary-darken-2; }
     .msg-body { height: auto; }
+    .todo-card {
+        border: solid $accent-darken-2;
+        margin: 0 1 1 1; padding: 0 1;
+        height: auto;
+    }
     """
     BINDINGS = [
         ("q", "quit", "Quit"),
@@ -383,6 +457,7 @@ class MuseCliApp(App):
         self._shell_procs: dict[str, object] = {}
         self._seen_replies: set[str] = self._load_seen()
         self._poll_n = 0
+        self._todo_cards: dict[str, TodoCard] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -530,7 +605,7 @@ class MuseCliApp(App):
         self._frame += 1
         for card in self.cards.values():
             card.tick(self._frame)
-        show_empty = not self.cards
+        show_empty = not self.cards and not self._todo_cards
         if show_empty != self._empty_shown:
             self._empty_shown = show_empty
             self.empty_state.display = show_empty
@@ -541,6 +616,7 @@ class MuseCliApp(App):
         self._poll_n += 1
         if self._poll_n % 10 == 0:  # ~1s
             self._poll_replies()
+            self._poll_todos()
 
     # -- messages: ~/.muse/messages (you -> Muse) / ~/.muse/replies (Muse -> you)
     @staticmethod
@@ -588,6 +664,46 @@ class MuseCliApp(App):
             self.notify("💬 reply from Muse")
         if new:
             self._save_seen()
+
+    # -- todos: ~/.muse/todos/*.md watched live --
+    def _poll_todos(self) -> None:
+        ensure_dirs()
+        try:
+            names = sorted(f for f in os.listdir(TODOS_DIR)
+                           if f.endswith(".md"))
+        except OSError:
+            names = []
+        for name in names:
+            card = self._todo_cards.get(name)
+            if card is None:
+                card = TodoCard(name)
+                self._todo_cards[name] = card
+                self.task_list.mount(card)
+                self.task_list.scroll_end(animate=False)
+            if not card.refresh_if_changed():
+                self._drop_todo(name)
+        for name in list(self._todo_cards):
+            if name not in names:
+                self._drop_todo(name)
+
+    def _drop_todo(self, name: str) -> None:
+        card = self._todo_cards.pop(name, None)
+        if card is not None:
+            try:
+                card.remove()
+            except Exception:
+                pass
+
+    def _list_todos(self) -> None:
+        if not self._todo_cards:
+            self.notify("no todo lists — write markdown to ~/.muse/todos/")
+            return
+        lines = ["todo lists:"]
+        for name in sorted(self._todo_cards):
+            card = self._todo_cards[name]
+            lines.append(f"  {name} · {card.progress_text or '?'}")
+        self.task_list.mount(Static("\n".join(lines), classes="help-card"))
+        self.task_list.scroll_end(animate=False)
 
     def _render_message_history(self) -> None:
         """Show recent messages/replies as history on startup (max 30)."""
@@ -801,6 +917,19 @@ class MuseCliApp(App):
                 self.session_id = arg
                 self._refresh_statusbar()
                 self.notify(f"session → {arg} (new tasks log here)")
+        elif name == "todos":
+            self._list_todos()
+        elif name == "todo":
+            if not arg:
+                self._list_todos()
+            else:
+                key = arg if arg.endswith(".md") else arg + ".md"
+                card = self._todo_cards.get(key)
+                if card is None:
+                    self.notify(f"no todo list: {arg} (see /todos)")
+                else:
+                    card.scroll_visible()
+                    self.notify(f"todo: {key} · {card.progress_text}")
         elif name == "export":
             self._export_session(arg)
         elif name in ("quit", "q"):
