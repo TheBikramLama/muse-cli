@@ -47,13 +47,19 @@ def _bad(msg: str) -> None:
     print(f"  \u2717 {msg}")
 
 
+def _python_ok() -> tuple[bool, str]:
+    vi = sys.version_info
+    py = f"{vi.major}.{vi.minor}.{vi.micro}"
+    return (vi >= (3, 10), py)
+
+
 def cmd_setup() -> int:
     print(f"muse-cli setup  (v{__version__})")
     print("=" * 46)
 
     # 1. Python
-    py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    if sys.version_info < (3, 10):
+    ok_py, py = _python_ok()
+    if not ok_py:
         _bad(f"Python {py} found \u2014 muse-cli needs 3.10+")
         return 1
     _ok(f"Python {py}")
