@@ -8,7 +8,7 @@ A full-screen TUI terminal bridge. Two-way communication between Muse and your M
 - **Task cards, not command spam:** each unit of work shows a human summary with a live spinner, elapsed time, and a streaming output tail that updates *in place*. Commands stay hidden until you press `c`; every finished task carries a one-line summary of what it did.
 - **Live link:** the status bar shows whether the Muse app is routing work through the bridge (● working / ○ idle) and whether the inbox watcher answering your messages is alive (`watcher ●` fresh / `⚠ silent` stale / `⚠ error`). Press `x` to cancel a running or queued task.
 
-Replaces the old `muse-runner.py` (kept under `legacy/` for reference). Unlike the old runner, it is not locked to one folder — commands may run anywhere under `~` by default (configurable).
+Replaces the old `muse-runner.py`. Unlike the old runner, it is not locked to one folder — commands may run anywhere under `~` by default (configurable).
 
 ## Quickstart
 
