@@ -18,21 +18,23 @@ from __future__ import annotations
 import os
 import json
 import re
-import shlex
 import subprocess
+import threading
 import time
 
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
-from textual.widgets import Footer, Header, Input, Static, TextArea
+from textual.widgets import Footer, Header, Input, Markdown, Static, TextArea
 
 from .bridge import Bridge
 from .config import load_settings
-from .paths import (EXPORTS_DIR, INPUT_HISTORY_PATH, PAUSED_PATH, SCRIPTS_DIR,
-                   SESSIONS_DIR, SETTINGS_PATH, ensure_dirs)
-from .protocol import cancel, submit
+from .paths import (EXPORTS_DIR, INPUT_HISTORY_PATH, MESSAGES_DIR, PAUSED_PATH,
+                   REPLIES_DIR, SCRIPTS_DIR, SEEN_PATH, SESSIONS_DIR,
+                   SETTINGS_PATH, ensure_dirs)
+from .protocol import cancel, new_id, submit
+from .runner import check_cwd
 from .sessions import load_recent, log_task, new_session
 
 SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -41,10 +43,22 @@ CHUNK_THROTTLE_S = 0.15
 SLASH_ALIASES = {"exit": "quit", "q": "quit", "h": "help", "resume": "sessions"}
 
 HELP_TEXT = """\
-Slash commands (type in the box below):
+Input modes (type in the box below):
+  /command     TUI commands — /help, /cd, /run, /skills, /todos, ...
+  !shell cmd   run a shell command right here (pipes, &&, etc. all work)
+  plain text   send a message to Muse (the app) — replies appear here
+
+Slash commands:
   /cd <dir>      change the working directory for new commands
   /run <name>    run a script from ~/.muse/scripts/
   /scripts       list scripts in ~/.muse/scripts/
+  /skills        list installed skills (● = in use by a running task)
+  /skill install <git-url|path>   install a Claude-compatible skill
+  /skill remove <name>            remove a skill
+  /skill show <name>              read a skill's SKILL.md
+  /todos         list your todo lists
+  /todo <name>   jump to a todo list
+  /autoapprove [on|off]  toggle auto-approval of approval requests
   /settings      show where settings.json lives
   /sessions      list past sessions (most recent first)
   /session <name> switch the session new tasks are logged to
@@ -64,13 +78,14 @@ Keys (when the input box is not focused — press Esc to leave it):
   r   retry the selected finished task
   a   approve the selected task (when awaiting approval)
   d   deny the selected task (when awaiting approval)
+  A   toggle auto-approve for approval requests
   y   copy the selected task's detail to the clipboard
   s   save the selected task's detail + output to ~/.muse/exports/
   g   jump to the newest task
   q   quit
 
-Click a task card to select it. Anything else you type is run as a
-command (split like a shell) in the session directory shown above.
+Click a task card to select it. Plain text you type is a message to Muse;
+prefix with ! to run it as a shell command instead.
 """
 
 
@@ -271,6 +286,27 @@ class TaskCard(Vertical):
         return self.task_text
 
 
+class MessageCard(Vertical):
+    """A chat message — yours (outgoing) or Muse's reply (incoming)."""
+
+    def __init__(self, mid: str, text: str, incoming: bool,
+                 at: float | None = None) -> None:
+        super().__init__(classes="msg-card" + (" incoming" if incoming else ""))
+        self.mid = mid
+        self.incoming = incoming
+        self.at = at or time.time()
+        self._text = text
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="task-head"):
+            yield Static("💬" if self.incoming else "🗨", classes="ticon done")
+            who = "Muse" if self.incoming else "you"
+            yield Static(who, classes="task-title")
+            yield Static(time.strftime("%H:%M", time.localtime(self.at)),
+                         classes="task-src")
+        yield Markdown(self._text, classes="msg-body")
+
+
 class MuseCliApp(App):
     TITLE = "muse-cli"
     CSS = """
@@ -307,6 +343,13 @@ class MuseCliApp(App):
         margin: 0 1 1 1; padding: 1;
         height: auto; color: $text;
     }
+    .msg-card {
+        border: solid $surface-lighten-2;
+        margin: 0 1 1 1; padding: 0 1;
+        height: auto;
+    }
+    .msg-card.incoming { border: solid $primary-darken-2; }
+    .msg-body { height: auto; }
     """
     BINDINGS = [
         ("q", "quit", "Quit"),
@@ -337,6 +380,9 @@ class MuseCliApp(App):
         self._hist_draft = ""
         self._empty_shown = True
         self._last_active = 0
+        self._shell_procs: dict[str, object] = {}
+        self._seen_replies: set[str] = self._load_seen()
+        self._poll_n = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -344,13 +390,13 @@ class MuseCliApp(App):
         yield self.statusbar
         self.task_list = ScrollableContainer(id="tasks")
         yield self.task_list
-        yield Input(placeholder="type a command, Enter to run · Esc for keys · /help", id="cmd")
+        yield Input(placeholder="/ command · ! shell · text = message to Muse", id="cmd")
         yield Footer()
 
     def on_mount(self) -> None:
         self._refresh_statusbar("bridge starting…")
         self.empty_state = Static(
-            "no tasks yet — type a command below, or /help for more",
+            "no tasks yet — /help for commands · ! for shell · plain text messages Muse",
             id="empty")
         self.task_list.mount(self.empty_state)
         for rec in load_recent(self.settings.get("tui", {}).get("history_limit", 50)):
@@ -359,6 +405,7 @@ class MuseCliApp(App):
                             rec.get("cwd"), restore_rec=rec)
             self.cards[card.rid] = card
             self.task_list.mount(card)
+        self._render_message_history()
         self._bridge = Bridge(
             self.settings,
             on_start=self._cb_start,
@@ -491,6 +538,84 @@ class MuseCliApp(App):
         if active != self._last_active:
             self._last_active = active
             self._refresh_statusbar()
+        self._poll_n += 1
+        if self._poll_n % 10 == 0:  # ~1s
+            self._poll_replies()
+
+    # -- messages: ~/.muse/messages (you -> Muse) / ~/.muse/replies (Muse -> you)
+    @staticmethod
+    def _load_seen() -> set[str]:
+        try:
+            with open(SEEN_PATH) as f:
+                ids = json.load(f)
+            return {x for x in ids if isinstance(x, str)}
+        except (OSError, ValueError):
+            return set()
+
+    def _save_seen(self) -> None:
+        try:
+            with open(SEEN_PATH, "w") as f:
+                json.dump(sorted(self._seen_replies), f)
+        except OSError:
+            pass
+
+    def _poll_replies(self) -> None:
+        try:
+            names = sorted(os.listdir(REPLIES_DIR))
+        except OSError:
+            return
+        new = False
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            mid = name[:-5]
+            if mid in self._seen_replies:
+                continue
+            try:
+                with open(os.path.join(REPLIES_DIR, name)) as f:
+                    payload = json.load(f)
+            except (OSError, ValueError):
+                continue
+            text = payload.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            card = MessageCard(mid, text, incoming=True,
+                               at=payload.get("at") or time.time())
+            self.task_list.mount(card)
+            self.task_list.scroll_end(animate=False)
+            self._seen_replies.add(mid)
+            new = True
+            self.notify("💬 reply from Muse")
+        if new:
+            self._save_seen()
+
+    def _render_message_history(self) -> None:
+        """Show recent messages/replies as history on startup (max 30)."""
+        items: list[tuple[float, bool, str, str]] = []
+        for d, incoming in ((MESSAGES_DIR, False), (REPLIES_DIR, True)):
+            try:
+                names = os.listdir(d)
+            except OSError:
+                continue
+            for name in names:
+                if not name.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(d, name)) as f:
+                        p = json.load(f)
+                    t = p.get("text")
+                    if isinstance(t, str) and t.strip():
+                        items.append((p.get("at") or 0, incoming,
+                                      name[:-5], t))
+                except (OSError, ValueError):
+                    continue
+        items.sort(key=lambda x: x[0])
+        for at, incoming, mid, text in items[-30:]:
+            if incoming:
+                self._seen_replies.add(mid)
+            self.task_list.mount(MessageCard(mid, text, incoming, at))
+        if items:
+            self._save_seen()
 
     # -- input box --
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -502,20 +627,127 @@ class MuseCliApp(App):
         if text.startswith("/"):
             self._slash(text)
             return
-        try:
-            cmd = shlex.split(text)
-        except ValueError as e:
-            self.notify(f"could not parse: {e}")
+        if text.startswith("!"):
+            self._shell(text[1:].strip())
             return
-        if not cmd:
+        self._send_message(text)
+
+    def _shell(self, cmd_text: str) -> None:
+        """Run a shell command right here in the TUI (bash -lc)."""
+        if not cmd_text:
+            self.notify("usage: !<shell command>")
             return
-        rid = submit(task=text[:80], cmd=cmd, cwd=self.session_cwd, source="local")
-        card = TaskCard(rid, text[:80], "local", cmd, self.session_cwd)
+        cwd, err = check_cwd(self.session_cwd,
+                             self.settings.get("allowed_roots", ["~"]))
+        if err:
+            self.notify(err)
+            return
+        rid = new_id()
+        task = f"! {cmd_text[:80]}"
+        card = TaskCard(rid, task, "shell", ["bash", "-lc", cmd_text], cwd)
         self.cards[rid] = card
         self.focused_rid = rid
         self.task_list.mount(card)
         self.task_list.scroll_end(animate=False)
         self.refresh_selection()
+
+        def _run() -> None:
+            t0 = time.time()
+            try:
+                proc = subprocess.Popen(
+                    ["bash", "-lc", cmd_text], cwd=cwd,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, errors="replace", bufsize=1,
+                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                )
+            except Exception as e:
+                res = self._shell_result(rid, task, cwd, cmd_text, t0,
+                                         ok=False, exit_code=None,
+                                         output="", error=str(e))
+                self.call_from_thread(self._shell_done, rid, res)
+                return
+            self._shell_procs[rid] = proc
+            chunks: list[str] = []
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    chunks.append(line)
+                    self.call_from_thread(self._shell_chunk, rid, line)
+                proc.wait(timeout=self.settings.get("default_timeout", 120))
+                exit_code = proc.returncode
+                error = ""
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                exit_code = None
+                error = "timed out"
+            except Exception as e:  # cancelled via x -> proc killed
+                exit_code = None
+                error = str(e) or "cancelled"
+            finally:
+                self._shell_procs.pop(rid, None)
+            res = self._shell_result(rid, task, cwd, cmd_text, t0,
+                                     ok=not error and exit_code == 0,
+                                     exit_code=exit_code,
+                                     output="".join(chunks), error=error)
+            try:
+                self.call_from_thread(self._shell_done, rid, res)
+            except RuntimeError:
+                if self.is_running:
+                    self._shell_done(rid, res)
+
+        threading.Thread(target=_run, daemon=True,
+                         name=f"muse-shell-{rid[:8]}").start()
+
+    @staticmethod
+    def _shell_result(rid: str, task: str, cwd: str, cmd_text: str, t0: float,
+                      ok: bool, exit_code: int | None,
+                      output: str, error: str) -> dict:
+        ended = time.time()
+        lines = [l for l in output.splitlines() if l.strip()]
+        tail = lines[-1][:120] if lines else "no output"
+        summary = (f"ok · {len(lines)} line(s) · {tail}" if ok
+                   else f"{error or f'exit {exit_code}'}")
+        return {
+            "id": rid, "ok": ok, "exit": exit_code,
+            "stdout": output, "stderr": "", "truncated": False,
+            "summary": summary, "started_at": t0, "ended_at": ended,
+            "duration_s": round(ended - t0, 1), "task": task,
+            "source": "shell", "cmd": ["bash", "-lc", cmd_text], "cwd": cwd,
+            "error": error,
+        }
+
+    def _shell_chunk(self, rid: str, line: str) -> None:
+        card = self.cards.get(rid)
+        if card is not None:
+            card.push_chunk(line)
+
+    def _shell_done(self, rid: str, res: dict) -> None:
+        card = self.cards.get(rid)
+        if card is not None:
+            card.finish(res)
+        log_task(self.session_id, res)
+        self.task_list.scroll_end(animate=False)
+        if self.settings.get("tui", {}).get("notify_on_done"):
+            self._notify_done(res)
+
+    def _send_message(self, text: str) -> None:
+        """Plain text is a message to the Muse app (not a command)."""
+        ensure_dirs()
+        mid = new_id()
+        payload = {"id": mid, "from": "tui", "text": text,
+                   "at": time.time()}
+        tmp = os.path.join(MESSAGES_DIR, mid + ".json.tmp")
+        try:
+            with open(tmp, "w") as f:
+                json.dump(payload, f)
+            os.replace(tmp, os.path.join(MESSAGES_DIR, mid + ".json"))
+        except OSError:
+            self.notify("could not send message")
+            return
+        card = MessageCard(mid, text, incoming=False, at=payload["at"])
+        self.task_list.mount(card)
+        self.task_list.scroll_end(animate=False)
+        self.notify("✉ sent to Muse — replies appear here")
 
     def _slash(self, text: str) -> None:
         parts = text[1:].split(None, 1)
@@ -803,6 +1035,14 @@ class MuseCliApp(App):
             card = running[0] if running else None
         if card is None:
             self.notify("nothing running")
+            return
+        proc = self._shell_procs.get(card.rid)
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            self.notify(f"cancelling: {card.task_text[:40]}")
             return
         cancel(card.rid)
         self.notify(f"cancelling: {card.task_text[:40]}")

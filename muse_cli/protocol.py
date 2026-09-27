@@ -46,7 +46,8 @@ def _atomic_write(path: str, payload: dict) -> None:
 
 def submit(task: str, cmd: list | None = None, cwd: str | None = None,
            timeout: int | None = None, source: str = "local",
-           reveal: bool = False, steps: list | None = None) -> str:
+           reveal: bool = False, steps: list | None = None,
+           skills: list | None = None) -> str:
     """Queue a request. Returns its id."""
     ensure_dirs()
     rid = new_id()
@@ -62,6 +63,8 @@ def submit(task: str, cmd: list | None = None, cwd: str | None = None,
     }
     if steps:
         req["steps"] = steps
+    if skills:
+        req["skills"] = [str(s) for s in skills]
     _atomic_write(os.path.join(QUEUE_DIR, rid + ".json"), req)
     return rid
 
