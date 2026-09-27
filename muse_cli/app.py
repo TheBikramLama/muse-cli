@@ -51,7 +51,7 @@ CHUNK_THROTTLE_S = 0.15
 SLASH_COMMANDS = [
     "/autoapprove", "/cd", "/clear", "/export", "/help", "/quit",
     "/restart", "/run", "/scripts", "/session", "/sessions", "/settings",
-    "/skill", "/skills", "/todo", "/todos",
+    "/sidebar", "/skill", "/skills", "/todo", "/todos",
 ]
 SKILL_SUBCOMMANDS = ["install", "remove", "show"]
 COMP_MAX = 10
@@ -189,6 +189,7 @@ Slash commands:
   /skill show <name>              read a skill's SKILL.md
   /todos         show your todo lists in the sidebar
   /todo <name>   expand a todo list in the sidebar
+  /sidebar       toggle the todo sidebar (works on narrow terminals too)
   /autoapprove [on|off]  toggle auto-approval of approval requests
   /settings      show where settings.json lives
   /sessions      list past sessions (most recent first)
@@ -773,8 +774,9 @@ class MuseCliApp(App):
         self._comp_start = 0
         self._comp_end = 0
         # Todo sidebar: shown when a todo list has open items; `t` toggles
-        # a manual hide override.
+        # a manual override (hide, or show even on a narrow terminal).
         self._sidebar_manual_hide = False
+        self._sidebar_manual_show = False
         # Double-Esc failsafe: two presses within this window stop everything.
         self._last_esc = 0.0
 
@@ -1278,7 +1280,8 @@ class MuseCliApp(App):
                         sec.mount(Static("(empty)", classes="todo-item done"))
         visible = (self._has_active_todos()
                    and not self._sidebar_manual_hide
-                   and self._sidebar_fits())
+                   and (self._sidebar_fits()
+                        or self._sidebar_manual_show))
         try:
             side.set_class(not visible, "hidden")
         except Exception:
@@ -1323,16 +1326,27 @@ class MuseCliApp(App):
         self.expand_todo(names[(i + delta) % len(names)])
 
     def action_toggle_sidebar(self) -> None:
-        self._sidebar_manual_hide = not self._sidebar_manual_hide
+        # Manual toggle overrides the narrow-screen auto-hide: if the
+        # sidebar is currently visible, hide it; otherwise show it even
+        # on a narrow terminal.
+        currently_visible = (self._has_active_todos()
+                             and not self._sidebar_manual_hide
+                             and (self._sidebar_fits()
+                                  or self._sidebar_manual_show))
+        if currently_visible:
+            self._sidebar_manual_hide = True
+            self._sidebar_manual_show = False
+        else:
+            self._sidebar_manual_hide = False
+            self._sidebar_manual_show = True
         self._refresh_sidebar()
-        if not self._sidebar_manual_hide and not self._sidebar_fits():
-            self.notify("todo sidebar hidden — widen the terminal to show it")
 
     def _list_todos(self) -> None:
         if not self._todo_data:
             self.notify("no todo lists — write markdown to ~/.muse/todos/")
             return
         self._sidebar_manual_hide = False
+        self._sidebar_manual_show = True
         self._refresh_sidebar()
         parts = [f"{n} · {r['done']}/{r['total']}"
                  for n, r in sorted(self._todo_data.items())]
@@ -1784,6 +1798,8 @@ class MuseCliApp(App):
                 self.notify(f"session → {arg} (new tasks log here)")
         elif name == "todos":
             self._list_todos()
+        elif name == "sidebar":
+            self.action_toggle_sidebar()
         elif name == "todo":
             if not arg:
                 self._list_todos()
@@ -1794,6 +1810,7 @@ class MuseCliApp(App):
                     self.notify(f"no todo list: {arg} (see /todos)")
                 else:
                     self._sidebar_manual_hide = False
+                    self._sidebar_manual_show = True
                     self.expand_todo(key)
                     self.notify(f"todo: {key} · {rec['done']}/{rec['total']}")
         elif name == "skills":
