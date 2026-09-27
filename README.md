@@ -4,6 +4,7 @@ A full-screen TUI terminal bridge. Two-way communication between Muse and your M
 
 - **Muse → Mac:** Muse drops a task file into `~/.muse/queue/`; the bridge runs it; the result lands in `~/.muse/results/`.
 - **You → Mac:** type in the TUI input box any time — mid-task or after — and watch it run live.
+- **Talk to Muse:** plain text in the input box goes to the Muse app as a message; its replies render as Markdown cards right in the feed.
 - **Task cards, not command spam:** each unit of work shows a human summary with a live spinner, elapsed time, and a streaming output tail that updates *in place*. Commands stay hidden until you press `c`; every finished task carries a one-line summary of what it did.
 - **Live link:** the status bar shows whether the Muse app is routing work through the bridge (● working / ○ idle). Press `x` to cancel a running or queued task.
 
@@ -57,9 +58,15 @@ Guardrails (live-editable in `~/.muse/settings.json`): executable allowlist, all
 ├── queue/          # inbound task files
 ├── results/        # finished results
 ├── cancel/         # drop an empty file named <task-id> to cancel it
+├── approval/       # parked approval requests
+├── messages/       # your plain-text messages to Muse
+├── replies/        # Muse's replies, rendered as cards
+├── todos/          # live Markdown checklists from Muse
 ├── sessions/       # JSONL history, one file per app run
-├── skills/         # your skills
-└── scripts/        # your scripts — run one with /run <name> in the TUI
+├── skills/         # your skills (each in <name>/SKILL.md)
+├── scripts/        # your scripts — run one with /run <name> in the TUI
+├── exports/        # saved task details / session exports
+└── input_history   # ↑/↓ history for the input box
 ```
 
 ## TUI
@@ -74,12 +81,13 @@ Guardrails (live-editable in `~/.muse/settings.json`): executable allowlist, all
 | `r` | retry the selected finished task |
 | `a` | approve the selected task (when awaiting approval) |
 | `d` | deny the selected task (when awaiting approval) |
+| `A` | toggle auto-approve — approval requests run without asking |
 | `y` | copy the selected task's detail to the clipboard |
 | `s` | save the selected task's detail to `~/.muse/exports/` |
 | `g` | jump to the newest task |
 | `q` | quit |
 
-Slash commands in the input box: `/cd <dir>`, `/run <script>`, `/scripts`, `/settings`, `/sessions`, `/clear`, `/help`, `/quit`. Aliases: `/exit` = `/quit`, `/q` = `/quit`, `/h` = `/help`, `/resume` = `/sessions`. Click a card to select it. The detail pane is a read-only text area, so you can also drag-select text with the mouse.
+Slash commands in the input box: `/cd <dir>`, `/run <script>`, `/scripts`, `/settings`, `/sessions`, `/session <name>`, `/export [name]`, `/todos`, `/todo <name>`, `/autoapprove [on|off]`, `/skills`, `/skill <show|install|remove> <name>`, `/clear`, `/help`, `/quit`. Aliases: `/exit` = `/quit`, `/q` = `/quit`, `/h` = `/help`, `/resume` = `/sessions`. Click a card to select it. The detail pane is a read-only text area, so you can also drag-select text with the mouse.
 
 ## Input / output polish
 
@@ -111,9 +119,39 @@ A request with `"needs_approval": true` is parked in `~/.muse/approval/` instead
 
 A request can carry `steps: [{"name": ..., "cmd": [...], "cwd": ...}]` instead of a single `cmd`. The bridge runs them sequentially inside one task card, stops at the first failing step, and reports per-step outcomes. The card shows `▸ 2/4 · step name` live; the result summary reads `ok · 4/4 steps` or `failed at step 2/4 (name): reason`. Plain single-command requests are unchanged.
 
+## Input modes
+
+The input box routes on its first character:
+
+- `/help` — slash commands (see the TUI table above).
+- `!ls -la` — runs a shell command via `bash -lc` in a task card: streaming, cancellable with `x`, cwd-guardrailed, and logged. Output is capped (`max_output_bytes`, default 256 KB — over-long output is truncated with a note), and a real deadline is enforced: a hung command is killed at `timeout` seconds instead of hanging the bridge.
+- anything else — sends a message to Muse. It lands in `~/.muse/messages/<id>.json`; Muse's replies are polled from `~/.muse/replies/` about once a second and rendered as Markdown cards. Recent messages are restored at startup.
+
+## Todo lists
+
+Muse can drop Markdown checklists into `~/.muse/todos/<name>.md`. The TUI watches the directory (~1/s) and renders each file as a live card: the Markdown body plus checkbox progress (`- [x]` counts as done, shown as `n/m`). `/todos` lists them, `/todo <name>` jumps to one.
+
+## Auto-approve
+
+Requests with `"needs_approval": true` park in `~/.muse/approval/` until you press `a`/`d`. Press `A` (or `/autoapprove on`) to skip the asking — approval requests run straight through. Persists in `~/.muse/settings.json` (`auto_approve`, default off); the status bar shows the state.
+
+## Skills
+
+Skills live in `~/.muse/skills/<name>/SKILL.md` — plain Markdown with `name:`/`description:` frontmatter (no YAML dependency).
+
+- `/skills` — `○` installed, `●` referenced by a running task
+- `/skill show <name>` — read the SKILL.md
+- `/skill install <git-url|local-path>` — shallow-clone or copy in (must contain a root `SKILL.md`)
+- `/skill remove <name>`
+
+Task requests can carry `"skills": ["name", …]`; the card shows a `⚙` badge and the names persist into results and session history. Note: this is the SKILL.md + frontmatter convention only, not the full Claude marketplace/plugin system.
+
+## Muse inbox watcher
+
+Plain-text messages only become a conversation if something on the Muse side reads them. A scheduled job (every ~2 minutes) watches `~/.muse/messages/`, treats each new file as your instruction, does the work — via the same `~/.muse/queue/` bridge when it needs your Mac — and writes a Markdown reply to `~/.muse/replies/<id>.json`, which the TUI renders as a card. Each message is answered exactly once (processed IDs are tracked); your outgoing files are kept so the startup history view still works.
+
 ## Roadmap ideas
 
 - True PTY streaming for interactive commands
 - Approvals: pause a task and ask the user before continuing
-- Skills picker wired to `~/.muse/skills/`
 - Remote attach: watch the bridge from another machine
