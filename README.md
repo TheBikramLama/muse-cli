@@ -65,13 +65,21 @@ Guardrails (live-editable in `~/.muse/settings.json`): executable allowlist, all
 
 | Key | Action |
 |-----|--------|
+| `j` / `k` | move selection between task cards |
+| `/` | jump back to the input box (`Esc` leaves it so keys work) |
 | `c` | show/hide the selected task's commands + full output |
 | `x` | cancel the selected (or currently running) task |
+| `a` | approve the selected task (when awaiting approval) |
+| `d` | deny the selected task (when awaiting approval) |
 | `y` | copy the selected task's detail to the clipboard |
 | `g` | jump to the newest task |
 | `q` | quit |
 
 Slash commands in the input box: `/cd <dir>`, `/run <script>`, `/scripts`, `/settings`, `/sessions`, `/clear`, `/help`, `/quit`. Aliases: `/exit` = `/quit`, `/q` = `/quit`, `/h` = `/help`, `/resume` = `/sessions`. Click a card to select it. The detail pane is a read-only text area, so you can also drag-select text with the mouse.
+
+## Approvals
+
+A request with `"needs_approval": true` is parked in `~/.muse/approval/` instead of running. The TUI shows it as `⏸ awaiting approval` — press `a` to approve (it queues and runs) or `d` to deny (`denied by user` result). Parked requests survive a restart and reappear on launch. (Headless `--daemon` can't approve; requests just wait.)
 
 ## Multi-step tasks
 

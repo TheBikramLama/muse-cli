@@ -11,9 +11,12 @@ SESSIONS_DIR = os.path.join(MUSE_HOME, "sessions")
 SKILLS_DIR = os.path.join(MUSE_HOME, "skills")
 SCRIPTS_DIR = os.path.join(MUSE_HOME, "scripts")
 CANCEL_DIR = os.path.join(MUSE_HOME, "cancel")
+APPROVAL_DIR = os.path.join(MUSE_HOME, "approval")
+EXPORTS_DIR = os.path.join(MUSE_HOME, "exports")
 SETTINGS_PATH = os.path.join(MUSE_HOME, "settings.json")
 
-ALL_DIRS = [QUEUE_DIR, RESULTS_DIR, SESSIONS_DIR, SKILLS_DIR, SCRIPTS_DIR, CANCEL_DIR]
+ALL_DIRS = [QUEUE_DIR, RESULTS_DIR, SESSIONS_DIR, SKILLS_DIR, SCRIPTS_DIR,
+            CANCEL_DIR, APPROVAL_DIR, EXPORTS_DIR]
 
 
 def ensure_dirs() -> None:

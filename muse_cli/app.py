@@ -21,6 +21,7 @@ import subprocess
 import time
 
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.widgets import Footer, Header, Input, Static, TextArea
@@ -49,9 +50,13 @@ Slash commands (type in the box below):
 
 Aliases: /exit = /quit, /q = /quit, /h = /help, /resume = /sessions
 
-Keys:
+Keys (when the input box is not focused — press Esc to leave it):
+  j/k move selection between tasks
+  /   jump back to the input box
   c   show/hide the selected task's commands + full output
   x   cancel the selected (or currently running) task
+  a   approve the selected task (when awaiting approval)
+  d   deny the selected task (when awaiting approval)
   y   copy the selected task's detail to the clipboard
   g   jump to the newest task
   q   quit
@@ -95,6 +100,7 @@ class TaskCard(Vertical):
         self._composed = False
         self._restore_rec = restore_rec
         self._pending_result: dict | None = None
+        self.awaiting = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(classes="task-head"):
@@ -121,13 +127,42 @@ class TaskCard(Vertical):
         elif self._restore_rec is not None:
             rec, self._restore_rec = self._restore_rec, None
             self.restore(rec)
+        elif self.awaiting:
+            self._show_awaiting()
         elif not self.done:
             self.live.update("starting…")
 
     # -- live updates (invoked on the UI thread via call_from_thread) --
     def mark_running(self) -> None:
+        self.awaiting = False
+        if not self._composed:
+            return
+        self.icon.update("●")
+        self.icon.remove_class("awaiting")
+        self.icon.add_class("running")
+        self._step_text = ""
+        self._tail = []
+        self.live.update("starting…")
+
+    def mark_awaiting(self) -> None:
+        self.awaiting = True
         if self._composed:
-            self.live.update("starting…")
+            self._show_awaiting()
+
+    def _show_awaiting(self) -> None:
+        self.icon.update("⏸")
+        self.icon.remove_class("running")
+        self.icon.add_class("awaiting")
+        self.live.update("⏸ awaiting approval — a approve · d deny")
+
+    def mark_approved(self) -> None:
+        self.awaiting = False
+        if not self._composed:
+            return
+        self.icon.update("●")
+        self.icon.remove_class("awaiting")
+        self.icon.add_class("running")
+        self.live.update("approved ✓ — starting…")
 
     def set_step(self, i: int, n: int, name: str) -> None:
         self._step_text = f"\u25b8 {i}/{n} \u00b7 {name}"
@@ -162,6 +197,7 @@ class TaskCard(Vertical):
             self._pending_result = res
             return
         self.done = True
+        self.awaiting = False
         self.result = res
         ok = bool(res.get("ok")) and res.get("exit", 1) == 0
         self.icon.update("✓" if ok else "✗")
@@ -247,6 +283,7 @@ class MuseCliApp(App):
     .ticon { width: 3; color: $warning; }
     .ticon.done { color: $success; }
     .ticon.failed { color: $error; }
+    .ticon.awaiting { color: $warning; }
     .task-title { width: 1fr; text-style: bold; }
     .task-src { width: auto; color: $text-muted; margin-left: 1; }
     .task-elapsed { width: auto; color: $text-muted; margin-left: 1; }
@@ -262,6 +299,8 @@ class MuseCliApp(App):
         ("q", "quit", "Quit"),
         ("c", "toggle_detail", "Commands"),
         ("x", "cancel_task", "Cancel"),
+        ("a", "approve_task", "Approve"),
+        ("d", "deny_task", "Deny"),
         ("y", "copy_task", "Copy"),
         ("g", "scroll_bottom", "Bottom"),
     ]
@@ -284,7 +323,7 @@ class MuseCliApp(App):
         yield self.statusbar
         self.task_list = ScrollableContainer(id="tasks")
         yield self.task_list
-        yield Input(placeholder="type a command, Enter to run · /help", id="cmd")
+        yield Input(placeholder="type a command, Enter to run · Esc for keys · /help", id="cmd")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -301,8 +340,11 @@ class MuseCliApp(App):
             on_chunk=self._cb_chunk,
             on_result=self._cb_result,
             on_step=self._cb_step,
+            on_approval=self._cb_approval,
         )
         self._bridge.start()
+        for req in self._bridge.pending_approvals():
+            self._on_approval(req)
         self._refresh_statusbar("bridge online")
         self.set_interval(0.1, self._tick)
         self.task_list.scroll_end(animate=False)
@@ -319,6 +361,14 @@ class MuseCliApp(App):
     def _safe_call(self, fn, *args) -> None:
         try:
             self.call_from_thread(fn, *args)
+        except RuntimeError:
+            # Already on the app thread (e.g. deny() triggered by a key
+            # action runs the bridge callback synchronously): call directly.
+            if self.is_running:
+                try:
+                    fn(*args)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -337,6 +387,9 @@ class MuseCliApp(App):
 
     def _cb_step(self, rid: str, i: int, n: int, name: str) -> None:
         self._safe_call(self._on_step, rid, i, n, name)
+
+    def _cb_approval(self, req: dict) -> None:
+        self._safe_call(self._on_approval, req)
 
     # -- UI-thread handlers --
     def _on_start(self, req: dict) -> None:
@@ -366,6 +419,21 @@ class MuseCliApp(App):
         card = self.cards.get(rid)
         if card is not None:
             card.set_step(i, n, name)
+
+    def _on_approval(self, req: dict) -> None:
+        rid = req["id"]
+        card = self.cards.get(rid)
+        if card is None:
+            card = TaskCard(rid, req.get("task", ""), req.get("source", "muse"),
+                            req.get("cmd", []), req.get("cwd"),
+                            steps=req.get("steps"))
+            self.cards[rid] = card
+            self.focused_rid = rid
+            self.task_list.mount(card)
+            self.task_list.scroll_end(animate=False)
+            self.refresh_selection()
+        card.mark_awaiting()
+        self.notify(f"approval needed: {card.task_text[:50]}")
 
     def _on_result(self, res: dict) -> None:
         if res.get("source") == "muse":
@@ -479,6 +547,43 @@ class MuseCliApp(App):
         self.task_list.mount(Static("\n".join(lines), classes="help-card"))
         self.task_list.scroll_end(animate=False)
 
+    def on_key(self, event: events.Key) -> None:
+        """Keyboard-first navigation.
+
+        Single-letter bindings only fire when the input box is NOT focused
+        (Textual gives typed characters to the focused Input). Esc leaves
+        the input so the keys work; / jumps back into it; j/k move the
+        selection between task cards.
+        """
+        in_input = isinstance(self.focused, Input)
+        if event.key == "escape" and in_input:
+            self.query_one("#cmd", Input).blur()
+            event.prevent_default()
+        elif event.key == "slash" and not in_input:
+            self.query_one("#cmd", Input).focus()
+            event.prevent_default()
+        elif event.key in ("j", "down") and not in_input:
+            self._move_selection(1)
+            event.prevent_default()
+        elif event.key in ("k", "up") and not in_input:
+            self._move_selection(-1)
+            event.prevent_default()
+
+    def _move_selection(self, delta: int) -> None:
+        rids = [c.rid for c in self.task_list.query(TaskCard)]
+        if not rids:
+            return
+        try:
+            i = rids.index(self.focused_rid)
+        except ValueError:
+            i = -1 if delta > 0 else 0
+        i = max(0, min(len(rids) - 1, i + delta))
+        self.focused_rid = rids[i]
+        self.refresh_selection()
+        card = self.cards.get(self.focused_rid)
+        if card is not None:
+            card.scroll_visible()
+
     # -- selection, keybindings, status --
     def refresh_selection(self) -> None:
         for rid, card in self.cards.items():
@@ -494,6 +599,35 @@ class MuseCliApp(App):
             return
         assert card._detail is not None
         self.notify("commands shown" if card._detail.display else "commands hidden")
+
+    def _approval_card(self):
+        card = self.cards.get(self.focused_rid or "")
+        if card is None or not card.awaiting:
+            self.notify("no task awaiting approval")
+            return None
+        if self._bridge is None:
+            self.notify("bridge not running")
+            return None
+        return card
+
+    def action_approve_task(self) -> None:
+        card = self._approval_card()
+        if card is None or self._bridge is None:
+            return
+        if self._bridge.approve(card.rid):
+            card.mark_approved()
+            self.notify("approved — queued")
+        else:
+            self.notify("approval expired")
+
+    def action_deny_task(self) -> None:
+        card = self._approval_card()
+        if card is None or self._bridge is None:
+            return
+        if self._bridge.deny(card.rid):
+            self.notify("denied")
+        else:
+            self.notify("approval expired")
 
     def action_cancel_task(self) -> None:
         card = self.cards.get(self.focused_rid or "")

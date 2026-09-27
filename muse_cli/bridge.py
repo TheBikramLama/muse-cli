@@ -20,7 +20,7 @@ import threading
 import time
 
 from .config import load_settings
-from .paths import CANCEL_DIR, QUEUE_DIR, ensure_dirs
+from .paths import APPROVAL_DIR, CANCEL_DIR, QUEUE_DIR, ensure_dirs
 from .protocol import write_result
 from .runner import run_request, run_steps
 
@@ -64,12 +64,14 @@ def _call(cb, *args) -> None:
 
 
 class Bridge:
-    def __init__(self, settings: dict, on_start=None, on_chunk=None, on_result=None, on_step=None):
+    def __init__(self, settings: dict, on_start=None, on_chunk=None, on_result=None,
+                 on_step=None, on_approval=None):
         self.settings = settings
         self.on_start = on_start
         self.on_chunk = on_chunk
         self.on_result = on_result
         self.on_step = on_step
+        self.on_approval = on_approval
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._attempts: dict[str, int] = {}
@@ -161,6 +163,17 @@ class Bridge:
             _call(self.on_result, res)
             return
 
+        if req.get("needs_approval") and not req.get("approved"):
+            # Park it for a human decision; the TUI approves (a) or denies (d).
+            ensure_dirs()
+            try:
+                with open(os.path.join(APPROVAL_DIR, rid + ".json"), "w") as f:
+                    json.dump(req, f)
+            except OSError:
+                pass
+            _call(self.on_approval, req)
+            return
+
         _call(self.on_start, req)
 
         def _chunk(line: str) -> None:
@@ -187,6 +200,72 @@ class Bridge:
             res["exit"] = None
         write_result(res)
         _call(self.on_result, res)
+
+    # -- approvals --
+    def pending_approvals(self) -> list[dict]:
+        """Requests parked in the approval dir (e.g. across a restart)."""
+        reqs: list[dict] = []
+        try:
+            names = sorted(os.listdir(APPROVAL_DIR))
+        except OSError:
+            return []
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(APPROVAL_DIR, name)) as f:
+                    reqs.append(json.load(f))
+            except Exception:
+                continue
+        return reqs
+
+    def approve(self, rid: str) -> bool:
+        """Re-queue an awaiting request. False when the id is unknown."""
+        src = os.path.join(APPROVAL_DIR, rid + ".json")
+        try:
+            with open(src) as f:
+                req = json.load(f)
+        except (OSError, ValueError):
+            return False
+        req["approved"] = True
+        try:
+            with open(os.path.join(QUEUE_DIR, rid + ".json"), "w") as f:
+                json.dump(req, f)
+        except OSError:
+            return False
+        _rm(src)
+        return True
+
+    def deny(self, rid: str) -> bool:
+        """Reject an awaiting request. False when the id is unknown."""
+        src = os.path.join(APPROVAL_DIR, rid + ".json")
+        try:
+            with open(src) as f:
+                req = json.load(f)
+        except (OSError, ValueError):
+            return False
+        _rm(src)
+        now = time.time()
+        res = {
+            "id": rid,
+            "ok": False,
+            "error": "denied",
+            "exit": None,
+            "stdout": "",
+            "stderr": "",
+            "truncated": False,
+            "summary": "denied by user",
+            "started_at": now,
+            "ended_at": now,
+            "duration_s": 0,
+            "task": req.get("task", ""),
+            "source": req.get("source", "muse"),
+            "cmd": req.get("cmd", []),
+            "cwd": req.get("cwd"),
+        }
+        write_result(res)
+        _call(self.on_result, res)
+        return True
 
 
 def run_daemon() -> None:

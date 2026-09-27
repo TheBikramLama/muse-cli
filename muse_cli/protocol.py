@@ -18,6 +18,10 @@ Multi-step: instead of a single `cmd`, a request may carry `steps`. The
 bridge runs them sequentially inside one task card, stops at the first
 failing step, and reports per-step outcomes in the result's `steps` array.
 Each step's `cwd` defaults to the request's `cwd`.
+
+`needs_approval: true` parks the request in `~/.muse/approval/` instead of
+running it — the TUI shows it as awaiting and the user approves (`a`) or
+denies (`d`). Denied tasks get a `denied by user` result.
 """
 from __future__ import annotations
 
