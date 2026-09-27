@@ -50,10 +50,15 @@ WATCHER_STALE_S = 300
 # Remote control: any Muse chat can drop {"op": ...} JSON here and the TUI
 # picks it up (~1s). Session-tagged, local-only.
 TUI_CMD_DIR = os.path.join(MUSE_HOME, "tui-cmd")
+# Agent-pushed realtime status: the Muse-side agent writes human-readable
+# progress lines to STATUS_DIR/<task_id>.txt while a task runs; the TUI
+# surfaces the latest line on the task card live. See PROTOCOL.md.
+STATUS_DIR = os.path.join(MUSE_HOME, "status")
+IDENTITY_PATH = os.path.join(MUSE_HOME, "cli-identity.json")
 
 ALL_DIRS = [QUEUE_DIR, RESULTS_DIR, SESSIONS_DIR, SKILLS_DIR, SCRIPTS_DIR,
             CANCEL_DIR, APPROVAL_DIR, EXPORTS_DIR,
-            MESSAGES_DIR, REPLIES_DIR, TODOS_DIR, TUI_CMD_DIR]
+            MESSAGES_DIR, REPLIES_DIR, TODOS_DIR, TUI_CMD_DIR, STATUS_DIR]
 
 
 def ensure_dirs() -> None:

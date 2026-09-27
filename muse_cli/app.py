@@ -37,8 +37,8 @@ from .bridge import Bridge
 from .config import load_settings, save_settings
 from .paths import (DEFAULT_SESSION, EXPORTS_DIR, INPUT_HISTORY_PATH,
                    MESSAGES_DIR, PAUSED_PATH, REPLIES_DIR, SCRIPTS_DIR,
-                   SEEN_PATH, SESSIONS_DIR, SETTINGS_PATH, TODOS_DIR,
-                   TUI_CMD_DIR, WATCHER_JSON, WATCHER_STALE_S,
+                   SEEN_PATH, SESSIONS_DIR, SETTINGS_PATH, STATUS_DIR,
+                   TODOS_DIR, TUI_CMD_DIR, WATCHER_JSON, WATCHER_STALE_S,
                    ensure_dirs, valid_session)
 from .protocol import cancel, new_id, submit
 from .runner import check_cwd
@@ -266,6 +266,7 @@ class TaskCard(Vertical):
         self.done = False
         self.result: dict | None = None
         self._line = ""  # single live line (last chunk or step), not a tail
+        self._status_mtime = 0.0  # last seen mtime of STATUS_DIR/<rid>.txt
         self._detail: TextArea | None = None
         # Mounting is async: compose() hasn't run until on_mount fires, so
         # anything touching composed widgets is deferred/guarded via these.
@@ -361,6 +362,33 @@ class TaskCard(Vertical):
             return
         self.icon.update(SPINNER[frame % len(SPINNER)])
         self.elapsed.update(f"{time.time() - self.t0:.0f}s")
+        self._poll_agent_status()
+
+    def _poll_agent_status(self) -> None:
+        """Pick up agent-pushed realtime status.
+
+        While a task runs, the Muse-side agent may write human-readable
+        progress lines to ``~/.muse/status/<rid>.txt`` (one per line). The
+        latest non-empty line becomes the card's live line, so the user sees
+        what the agent is actually doing instead of a stale spinner text.
+        """
+        try:
+            sp = os.path.join(STATUS_DIR, self.rid + ".txt")
+            mt = os.path.getmtime(sp)
+        except OSError:
+            return
+        if mt <= self._status_mtime:
+            return
+        self._status_mtime = mt
+        try:
+            with open(sp, encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+        except OSError:
+            return
+        if lines:
+            self._line = lines[-1]
+            self._step_text = ""
+            self._render_live()
 
     def finish(self, res: dict) -> None:
         if not self._composed:
@@ -370,6 +398,10 @@ class TaskCard(Vertical):
         self.done = True
         self.awaiting = False
         self.result = res
+        try:
+            os.remove(os.path.join(STATUS_DIR, self.rid + ".txt"))
+        except OSError:
+            pass
         ok = bool(res.get("ok")) and res.get("exit", 1) == 0
         self.icon.update("✓" if ok else "✗")
         self.icon.remove_class("running")
@@ -382,10 +414,17 @@ class TaskCard(Vertical):
               time.strftime("%H:%M:%S", time.localtime()))
         summary = res.get("summary") or res.get("error") or "done"
         self.live.update(f"{summary} · {ts} · {dur:.1f}s")
-        self._detail = TextArea(self._detail_text(res), read_only=True,
-                                classes="detail")
-        self._detail.display = False
-        self.mount(self._detail)
+        if self._detail is None:
+            self._detail = TextArea(self._detail_text(res), read_only=True,
+                                    classes="detail")
+            self._detail.display = False
+            self.mount(self._detail)
+        else:
+            # Detail view was lazily built while running; refresh with result.
+            try:
+                self._detail.text = self._detail_text(res)
+            except Exception:
+                pass
 
     def restore(self, rec: dict) -> None:
         """Rebuild a finished card from session history."""
@@ -441,7 +480,16 @@ class TaskCard(Vertical):
 
     def toggle_detail(self) -> bool:
         if self._detail is None:
-            return False
+            # Lazily build the detail view so `c` works while the task is
+            # still running (shows the command + what we know so far).
+            try:
+                self._detail = TextArea(
+                    self._detail_text(self.result or {}), read_only=True,
+                    classes="detail")
+                self._detail.display = False
+                self.mount(self._detail)
+            except Exception:
+                return False
         self._detail.display = not self._detail.display
         return True
 

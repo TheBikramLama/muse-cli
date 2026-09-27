@@ -1,22 +1,51 @@
 # muse-cli
 
-A full-screen TUI terminal bridge. Two-way communication between Muse and your Mac — like a coding-agent CLI (claude code / codex style), but the agent on the other end can also be Muse itself.
+A full-screen terminal companion for Muse — like a coding-agent CLI (claude code / codex style), but the agent on the other end can also be Muse itself. Native terminal access, live task cards, and a visible link status, all in your terminal.
 
-- **Muse → Mac:** Muse drops a task file into `~/.muse/queue/`; the bridge runs it; the result lands in `~/.muse/results/`.
-- **You → Mac:** type in the TUI input box any time — mid-task or after — and watch it run live.
+- **Muse → your machine:** the assistant drops a task file into `~/.muse/queue/`; the bridge runs it; the result lands in `~/.muse/results/`.
+- **You → your machine:** type in the TUI input box any time — mid-task or after — and watch it run live.
 - **Talk to Muse:** plain text in the input box goes to the Muse app as a message; its replies render as Markdown cards right in the feed.
-- **Task cards, not command spam:** each unit of work shows a human summary with a live spinner, elapsed time, and a streaming output tail that updates *in place*. Commands stay hidden until you press `c`; every finished task carries a one-line summary of what it did.
-- **Live link:** the status bar shows whether the Muse app is routing work through the bridge (● working / ○ idle) and whether the inbox watcher answering your messages is alive (`watcher ●` fresh / `⚠ silent` stale / `⚠ error`). Press `x` to cancel a running or queued task.
+- **Task cards, not command spam:** each unit of work shows a human summary with a live spinner, elapsed time, and a streaming output tail that updates *in place*. Press `c` to reveal commands + full output (works while running, too); every finished task carries a one-line summary of what it did.
+- **Realtime agent status:** while a task runs, the assistant can push human-readable progress lines (`~/.muse/status/<task-id>.txt`) — the card's live line reflects what it's *actually doing*.
+- **Visible link:** the status bar shows the Muse connection state (`CLI ↔ Muse ● connected` / `⚠ silent` / `○ not seen`) and the inbox watcher liveness. `muse-cli doctor` reports the same outside the TUI.
 
-Replaces the old `muse-runner.py`. Unlike the old runner, it is not locked to one folder — commands may run anywhere under `~` by default (configurable).
+## Install
 
-## Quickstart
+**macOS / Linux:**
 
 ```bash
-./run.sh                          # creates .venv on first run, then launches the TUI
-./run.sh --session work           # named instance — run parallel TUIs side by side
-./run.sh --daemon                 # bridge only, no TUI (plain stdout log)
+curl -fsSL https://raw.githubusercontent.com/TheBikramLama/muse-cli/main/install.sh | bash
 ```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/TheBikramLama/muse-cli/main/install.ps1 | iex
+```
+
+This installs to `~/.muse-cli` (virtualenv + dependencies included) and puts a
+`muse-cli` launcher on your PATH. Re-running updates an existing install.
+Requires Python 3.10+.
+
+Then pair it with the Muse app:
+
+```bash
+muse-cli setup     # one-time: creates ~/.muse, prints your pairing code
+muse-cli           # launch the TUI
+muse-cli doctor    # check the Muse connection any time
+```
+
+`muse-cli setup` prints a pairing code — tell your Muse assistant
+*"Connect to my muse-cli (pairing code XXXX-XXXX)"* along with the protocol doc
+below, and it will ping your CLI to confirm the link.
+
+## Protocol
+
+The full file-based protocol (queue, results, realtime status, messages,
+replies, heartbeat) is documented in [PROTOCOL.md](PROTOCOL.md) — it's what
+lets any assistant connect to a running CLI.
+
+## How it works (developer quickstart)
 
 ## How Muse uses it
 
@@ -64,6 +93,8 @@ Guardrails (live-editable in `~/.muse/settings.json`): executable allowlist, all
 ├── messages/       # your plain-text messages to Muse
 ├── replies/        # Muse's replies, rendered as cards
 ├── watcher.json    # inbox-watcher heartbeat (liveness for the TUI)
+├── status/         # agent-pushed realtime status: <task-id>.txt, latest line shown live
+├── cli-identity.json # CLI identity + pairing code (from `muse-cli setup`)
 ├── todos/          # live Markdown checklists from Muse
 ├── sessions/       # JSONL history, one file per app run
 ├── skills/         # your skills (each in <name>/SKILL.md)
