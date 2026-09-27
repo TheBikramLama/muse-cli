@@ -177,8 +177,10 @@ class Bridge:
             _call(self.on_result, res)
             return
 
-        if req.get("needs_approval") and not req.get("approved"):
+        if (req.get("needs_approval") and not req.get("approved")
+                and not self.settings.get("auto_approve")):
             # Park it for a human decision; the TUI approves (a) or denies (d).
+            # Skipped entirely when auto_approve is on in settings.
             ensure_dirs()
             try:
                 with open(os.path.join(APPROVAL_DIR, rid + ".json"), "w") as f:

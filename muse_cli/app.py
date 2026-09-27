@@ -29,7 +29,7 @@ from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.widgets import Footer, Header, Input, Markdown, Static, TextArea
 
 from .bridge import Bridge
-from .config import load_settings
+from .config import load_settings, save_settings
 from .paths import (EXPORTS_DIR, INPUT_HISTORY_PATH, MESSAGES_DIR, PAUSED_PATH,
                    REPLIES_DIR, SCRIPTS_DIR, SEEN_PATH, SESSIONS_DIR,
                    SETTINGS_PATH, TODOS_DIR, ensure_dirs)
@@ -431,6 +431,7 @@ class MuseCliApp(App):
         ("x", "cancel_task", "Cancel"),
         ("a", "approve_task", "Approve"),
         ("d", "deny_task", "Deny"),
+        ("A", "toggle_auto_approve", "Auto-approve"),
         ("p", "toggle_pause", "Pause"),
         ("r", "retry_task", "Retry"),
         ("s", "save_output", "Save"),
@@ -930,6 +931,15 @@ class MuseCliApp(App):
                 else:
                     card.scroll_visible()
                     self.notify(f"todo: {key} · {card.progress_text}")
+        elif name == "autoapprove":
+            if not arg:
+                self._set_auto_approve(not self.settings.get("auto_approve", False))
+            elif arg == "on":
+                self._set_auto_approve(True)
+            elif arg == "off":
+                self._set_auto_approve(False)
+            else:
+                self.notify("usage: /autoapprove [on|off]")
         elif name == "export":
             self._export_session(arg)
         elif name in ("quit", "q"):
@@ -1124,6 +1134,21 @@ class MuseCliApp(App):
         else:
             self.notify("approval expired")
 
+    def action_toggle_auto_approve(self) -> None:
+        self._set_auto_approve(not self.settings.get("auto_approve", False))
+
+    def _set_auto_approve(self, on: bool) -> None:
+        self.settings["auto_approve"] = on
+        try:
+            save_settings(self.settings)
+        except OSError:
+            self.notify("could not save settings")
+            return
+        self._refresh_statusbar()
+        self.notify(f"auto-approve {'ON ⚡' if on else 'OFF'} — "
+                    + ("approval requests run immediately"
+                       if on else "approval requests park for a/d"))
+
     def action_toggle_pause(self) -> None:
         if os.path.exists(PAUSED_PATH):
             try:
@@ -1236,6 +1261,8 @@ class MuseCliApp(App):
             t.append(f" · {waiting} awaiting approval", style="yellow")
         if os.path.exists(PAUSED_PATH):
             t.append(" · ⏸ paused", style="yellow")
+        if self.settings.get("auto_approve"):
+            t.append(" · ⚡ auto-approve ON", style="yellow")
         if extra:
             t.append(f" · {extra}")
         self.statusbar.update(t)

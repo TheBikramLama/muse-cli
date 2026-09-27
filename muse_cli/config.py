@@ -22,6 +22,9 @@ DEFAULTS: dict = {
     "default_timeout": 120,
     "max_timeout": 1500,
     "max_output_bytes": 256 * 1024,
+    # When true, requests flagged needs_approval skip the approval park and
+    # run immediately. Default off — approve/deny stays a human decision.
+    "auto_approve": False,
     "tui": {
         "poll_interval": 0.5,
         "history_limit": 50,
