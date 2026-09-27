@@ -672,10 +672,9 @@ class MuseCliApp(App):
     TITLE = "muse-cli"
     CSS = """
     #topline {
-        height: 1;
+        height: 1; min-height: 1;
         background: $surface; color: $text;
         padding: 0 1;
-        border-bottom: solid $primary-darken-2;
     }
     #modeline {
         height: 1;
@@ -2427,7 +2426,8 @@ class MuseCliApp(App):
 
     # Activity line: a typing-indicator, not a card. Active tasks get an
     # animated amber icon + a state word + the live description in gray;
-    # idle gets a static gray "Waiting for you".
+    # idle gets a static gray "Idle" (never "Waiting for you" — that phrase
+    # misleads when the assistant is actually working elsewhere).
     DOUBLE_ESC_WINDOW = 0.7  # seconds between two Esc presses = stop all
 
     STATE_WORDS = (
@@ -2463,7 +2463,7 @@ class MuseCliApp(App):
             t.append(f"◷ {waiting} awaiting approval — a approve · d deny",
                      style="yellow")
         else:
-            t.append("○ Waiting for you", style="dim")
+            t.append("○ Idle", style="dim")
         try:
             self.activity_left.update(t)
             # Mini todo summary on the right, above the message box.
