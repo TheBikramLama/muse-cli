@@ -45,6 +45,7 @@ Poll `~/.muse/results/<uuid>.json` until it appears, read it, delete it. Result:
 - `task` is the human-readable summary shown in the TUI — always set it.
 - `cmd` is an argv list, never a shell string.
 - `source` is `"muse"` or `"local"`; `reveal: true` shows commands immediately.
+- `{"id": "<uuid>", "ping": true}` is a liveness check — the bridge answers `{"ok": true, "pong": true}` with no task card.
 
 Guardrails (live-editable in `~/.muse/settings.json`): executable allowlist, allowed cwd roots, timeouts, output caps. `GIT_TERMINAL_PROMPT=0` is set so git never hangs on credentials.
 

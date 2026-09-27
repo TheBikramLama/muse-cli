@@ -44,6 +44,12 @@ def load_settings() -> dict:
             settings["tui"] = tui
         except Exception:
             pass  # corrupt settings -> fall back to defaults
+    else:
+        # First run: write the defaults so the file exists and is discoverable.
+        try:
+            save_settings(settings)
+        except Exception:
+            pass
     return settings
 
 

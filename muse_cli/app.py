@@ -280,6 +280,11 @@ class MuseCliApp(App):
         padding: 0 1;
     }
     #tasks { height: 1fr; }
+    #empty {
+        text-align: center;
+        color: $text-muted;
+        padding: 2 1;
+    }
     #cmd { dock: bottom; margin: 0 1 1 1; }
     .task-card {
         border: solid $primary-darken-2;
@@ -330,6 +335,8 @@ class MuseCliApp(App):
         self._history: list[str] = self._load_history()
         self._hist_idx: int | None = None
         self._hist_draft = ""
+        self._empty_shown = True
+        self._last_active = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -342,6 +349,10 @@ class MuseCliApp(App):
 
     def on_mount(self) -> None:
         self._refresh_statusbar("bridge starting…")
+        self.empty_state = Static(
+            "no tasks yet — type a command below, or /help for more",
+            id="empty")
+        self.task_list.mount(self.empty_state)
         for rec in load_recent(self.settings.get("tui", {}).get("history_limit", 50)):
             card = TaskCard(rec.get("id", "?"), rec.get("task", ""),
                             rec.get("source", "muse"), rec.get("cmd", []),
@@ -461,10 +472,25 @@ class MuseCliApp(App):
         if self.settings.get("tui", {}).get("notify_on_done"):
             self._notify_done(res)
 
+    def _task_counts(self) -> tuple[int, int]:
+        """(running/active, awaiting-approval) card counts."""
+        active = sum(1 for c in self.cards.values()
+                     if not c.done and not c.awaiting)
+        waiting = sum(1 for c in self.cards.values() if c.awaiting)
+        return active, waiting
+
     def _tick(self) -> None:
         self._frame += 1
         for card in self.cards.values():
             card.tick(self._frame)
+        show_empty = not self.cards
+        if show_empty != self._empty_shown:
+            self._empty_shown = show_empty
+            self.empty_state.display = show_empty
+        active, _ = self._task_counts()
+        if active != self._last_active:
+            self._last_active = active
+            self._refresh_statusbar()
 
     # -- input box --
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -834,6 +860,11 @@ class MuseCliApp(App):
             t.append("● working", style="green")
         else:
             t.append("○ idle", style="dim")
+        active, waiting = self._task_counts()
+        if active:
+            t.append(f" · {active} active", style="cyan")
+        if waiting:
+            t.append(f" · {waiting} awaiting approval", style="yellow")
         if os.path.exists(PAUSED_PATH):
             t.append(" · ⏸ paused", style="yellow")
         if extra:

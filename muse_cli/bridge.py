@@ -151,6 +151,18 @@ class Bridge:
                 continue
             self._attempts.pop(rid, None)
             _rm(path)
+            if req.get("ping"):
+                # Liveness check (old muse-runner.py protocol): answer
+                # directly, no task card and no callbacks.
+                write_result({
+                    "id": rid,
+                    "ok": True,
+                    "pong": True,
+                    "task": "ping",
+                    "source": req.get("source", "muse"),
+                    "summary": "pong",
+                })
+                continue
             t = threading.Thread(target=self._run_one, args=(req,), daemon=True,
                                  name=f"muse-task-{rid[:8]}")
             t.start()
