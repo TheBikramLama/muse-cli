@@ -29,7 +29,7 @@ from textual.app import App, ComposeResult
 from textual.command import CommandPalette, Hit, Hits, Provider
 from textual.containers import Horizontal, ScrollableContainer, Vertical
 from textual.screen import Screen
-from textual.widgets import (Footer, Header, Input, Label, ListItem, ListView,
+from textual.widgets import (Footer, Input, Label, ListItem, ListView,
                               Markdown, Static, TextArea)
 
 from .bridge import Bridge
@@ -622,12 +622,13 @@ class MuseCliApp(App):
     TITLE = "muse-cli"
     CSS = """
     #topline {
-        dock: top; height: 1;
-        background: $surface; color: $text-muted;
+        height: 1;
+        background: $surface; color: $text;
         padding: 0 1;
+        border-bottom: solid $primary-darken-2;
     }
     #modeline {
-        dock: top; height: 1;
+        height: 1;
         background: $surface; color: $text-muted;
         padding: 0 1;
     }
@@ -662,7 +663,7 @@ class MuseCliApp(App):
         color: $text-muted;
         padding: 2 1;
     }
-    #cmd { margin: 0 1; }
+    #cmd { margin: 1 1 0 1; padding: 0 1; }
     #completion {
         height: auto; max-height: 8; margin: 0 1;
         border: solid $primary-darken-2;
@@ -818,11 +819,8 @@ class MuseCliApp(App):
         self.set_timer(timeout, toast.remove)
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
         self.topline = Static("", id="topline")
         yield self.topline
-        self.modeline = Static("", id="modeline")
-        yield self.modeline
         self.toasts = Vertical(id="toasts")
         yield self.toasts
         with Horizontal(id="main"):
@@ -844,6 +842,8 @@ class MuseCliApp(App):
         yield self.cmd_input
         self.cwdline = Static("", id="cwdline")
         yield self.cwdline
+        self.modeline = Static("", id="modeline")
+        yield self.modeline
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1341,6 +1341,20 @@ class MuseCliApp(App):
             self._sidebar_manual_show = True
         self._refresh_sidebar()
 
+    def _toggle_todos(self) -> None:
+        """Toggle the todo sidebar: hide if visible, show if hidden."""
+        if not self._todo_data:
+            self.notify("no todo lists — write markdown to ~/.muse/todos/")
+            return
+        # Reuse the manual toggle so narrow-screen override applies too.
+        self.action_toggle_sidebar()
+        if self._sidebar_manual_hide:
+            self.notify("todo sidebar hidden")
+        else:
+            parts = [f"{n} · {r['done']}/{r['total']}"
+                     for n, r in sorted(self._todo_data.items())]
+            self.notify("todos (sidebar): " + "   ".join(parts))
+
     def _list_todos(self) -> None:
         if not self._todo_data:
             self.notify("no todo lists — write markdown to ~/.muse/todos/")
@@ -1456,9 +1470,14 @@ class MuseCliApp(App):
         self._send_message(text)
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        # Refilter the open dropdown as the user types.
-        if not self.completion_open or event.input.id != "cmd":
+        # Refilter the open dropdown as the user types; auto-open it when
+        # they start a /command or !shell so the list appears without Tab.
+        if event.input.id != "cmd":
             return
+        text = event.value or ""
+        if not self.completion_open:
+            if not (text.startswith("/") or text.startswith("!")):
+                return
         start, end, cands = self._completion_data()
         token = event.value[start:event.input.cursor_position]
         if len(cands) == 1 and cands[0] == token:
@@ -1797,12 +1816,12 @@ class MuseCliApp(App):
                 self._refresh_statusbar()
                 self.notify(f"session → {arg} (new tasks log here)")
         elif name == "todos":
-            self._list_todos()
+            self._toggle_todos()
         elif name == "sidebar":
             self.action_toggle_sidebar()
         elif name == "todo":
             if not arg:
-                self._list_todos()
+                self._toggle_todos()
             else:
                 key = arg if arg.endswith(".md") else arg + ".md"
                 rec = self._todo_data.get(key)
@@ -2203,18 +2222,17 @@ class MuseCliApp(App):
         self._refresh_cwdline()
 
     def _refresh_topline(self) -> None:
+        # Header: app title · session · Muse connection status.
         t = Text()
-        t.append("muse-cli · ")
-        t.append(f"[{self.instance_session}]", style="bold")
-        t.append(" · bridge ")
-        t.append("●", style="green")
-        t.append(" · muse ")
+        t.append("muse-cli", style="bold")
+        t.append(f"  [{self.instance_session}]", style="bold yellow")
+        t.append("   muse ")
         if self._muse_running:
             t.append("● working", style="green")
         else:
-            t.append("○ idle", style="dim")
+            t.append("● connected", style="green")
         wtext, wstyle = self._watcher_segment()
-        t.append(" · watcher ")
+        t.append("   watcher ")
         t.append(wtext, style=wstyle)
         try:
             self.topline.update(t)
@@ -2284,7 +2302,29 @@ class MuseCliApp(App):
             pass
 
     def _refresh_cwdline(self) -> None:
+        # Compact: folder • branch ● (green = clean, orange = dirty).
+        folder = os.path.basename(os.path.abspath(self.session_cwd))
+        branch, dirty = "", False
         try:
-            self.cwdline.update(Text(f"cwd: {self.session_cwd}", style="dim"))
+            p = subprocess.run(["git", "branch", "--show-current"],
+                               cwd=self.session_cwd, capture_output=True,
+                               text=True, timeout=2)
+            if p.returncode == 0:
+                branch = p.stdout.strip()
+            p2 = subprocess.run(["git", "status", "--porcelain"],
+                                cwd=self.session_cwd, capture_output=True,
+                                text=True, timeout=2)
+            dirty = bool(p2.stdout.strip())
+        except Exception:
+            pass
+        t = Text()
+        t.append(folder, style="bold")
+        if branch:
+            t.append(" • ", style="dim")
+            t.append(branch, style="dim")
+            t.append(" ")
+            t.append("●", style="yellow" if dirty else "green")
+        try:
+            self.cwdline.update(t)
         except AttributeError:
             pass
