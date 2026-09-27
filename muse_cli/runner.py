@@ -165,3 +165,99 @@ def run_request(req: dict, settings: dict, on_chunk=None, on_proc=None) -> dict:
         "cmd": cmd,
         "cwd": cwd,
     }
+
+
+def _public_steps(ran: list[dict]) -> list[dict]:
+    """Per-step outcome summaries safe to ship in the aggregate result."""
+    return [{
+        "name": r.get("task", ""),
+        "ok": r["ok"],
+        "exit": r.get("exit"),
+        "duration_s": r.get("duration_s", 0),
+        "summary": r.get("summary") or r.get("error") or "",
+    } for r in ran]
+
+
+def run_steps(req: dict, settings: dict, on_chunk=None, on_proc=None,
+              on_step=None, is_cancelled=None) -> dict:
+    """Run a request's steps sequentially; stops at the first failing step.
+
+    A request without ``steps`` is a plain single-command request and is
+    handled exactly like before (identical result shape). With ``steps``,
+    each entry is ``{"name": str, "cmd": [str, ...], "cwd": str|None}``
+    and the result aggregates the per-step outcomes.
+    """
+    started = time.time()
+    rid = req.get("id", "?")
+    raw = req.get("steps")
+    if not raw:
+        return run_request(req, settings, on_chunk=on_chunk, on_proc=on_proc)
+    if not isinstance(raw, list):
+        return _fail(rid, "'steps' must be a list of {name, cmd, cwd}", started, req)
+
+    steps = []
+    for i, s in enumerate(raw, 1):
+        if not isinstance(s, dict):
+            return _fail(rid, f"step {i} must be an object", started, req)
+        cmd = s.get("cmd")
+        if (not isinstance(cmd, list) or not cmd
+                or not all(isinstance(a, str) for a in cmd)):
+            return _fail(rid, f"step {i}: 'cmd' must be a non-empty list of strings",
+                         started, req)
+        steps.append({"name": s.get("name") or f"step {i}",
+                      "cmd": cmd, "cwd": s.get("cwd", req.get("cwd"))})
+    n = len(steps)
+    if n == 0:
+        return _fail(rid, "'steps' must not be empty", started, req)
+
+    ran: list[dict] = []
+    for i, step in enumerate(steps, 1):
+        if is_cancelled is not None and is_cancelled():
+            agg = _fail(rid, f"cancelled at step {i}/{n} ({step['name']})",
+                        started, req)
+            agg["steps"] = _public_steps(ran)
+            return agg
+        if on_step is not None:
+            try:
+                on_step(i, n, step["name"])
+            except Exception:
+                pass
+        step_req = dict(req)
+        step_req["task"] = step["name"]
+        step_req["cmd"] = step["cmd"]
+        step_req["cwd"] = step["cwd"]
+        res = run_request(step_req, settings, on_chunk=on_chunk, on_proc=on_proc)
+        ran.append(res)
+        if not res["ok"] or (res.get("exit") or 0) != 0:
+            break
+
+    failed = next((r for r in ran
+                   if not r["ok"] or (r.get("exit") or 0) != 0), None)
+    ok = failed is None
+    max_out = settings.get("max_output_bytes", 256 * 1024)
+    stdout, t1 = _cap("\n".join(r["stdout"] for r in ran), max_out)
+    stderr, t2 = _cap("\n".join(r["stderr"] for r in ran), max_out)
+    if ok:
+        summary = f"ok \u00b7 {n}/{n} steps"
+    else:
+        idx = ran.index(failed) + 1
+        tail = (failed.get("summary") or failed.get("error") or "")[:120]
+        summary = f"failed at step {idx}/{n} ({failed.get('task')}): {tail}"
+    ended = time.time()
+    return {
+        "id": rid,
+        "ok": ok,
+        "exit": 0 if ok else failed.get("exit"),
+        "stdout": stdout,
+        "stderr": stderr,
+        "truncated": t1 or t2,
+        "summary": summary,
+        "started_at": started,
+        "ended_at": ended,
+        "duration_s": round(ended - started, 1),
+        "task": req.get("task", ""),
+        "source": req.get("source", "muse"),
+        "cmd": req.get("cmd", []),
+        "cwd": req.get("cwd"),
+        "steps": _public_steps(ran),
+    }

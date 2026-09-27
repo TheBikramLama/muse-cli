@@ -22,7 +22,7 @@ import time
 from .config import load_settings
 from .paths import CANCEL_DIR, QUEUE_DIR, ensure_dirs
 from .protocol import write_result
-from .runner import run_request
+from .runner import run_request, run_steps
 
 MAX_PARSE_ATTEMPTS = 20
 
@@ -64,11 +64,12 @@ def _call(cb, *args) -> None:
 
 
 class Bridge:
-    def __init__(self, settings: dict, on_start=None, on_chunk=None, on_result=None):
+    def __init__(self, settings: dict, on_start=None, on_chunk=None, on_result=None, on_step=None):
         self.settings = settings
         self.on_start = on_start
         self.on_chunk = on_chunk
         self.on_result = on_result
+        self.on_step = on_step
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._attempts: dict[str, int] = {}
@@ -168,8 +169,13 @@ class Bridge:
         def _got_proc(proc) -> None:
             self._procs[rid] = proc
 
+        def _step(i: int, n: int, name: str) -> None:
+            _call(self.on_step, rid, i, n, name)
+
         try:
-            res = run_request(req, self.settings, on_chunk=_chunk, on_proc=_got_proc)
+            res = run_steps(req, self.settings, on_chunk=_chunk, on_proc=_got_proc,
+                            on_step=_step,
+                            is_cancelled=lambda: rid in self._cancelled)
         finally:
             self._procs.pop(rid, None)
 

@@ -73,6 +73,10 @@ Guardrails (live-editable in `~/.muse/settings.json`): executable allowlist, all
 
 Slash commands in the input box: `/cd <dir>`, `/run <script>`, `/scripts`, `/settings`, `/sessions`, `/clear`, `/help`, `/quit`. Aliases: `/exit` = `/quit`, `/q` = `/quit`, `/h` = `/help`, `/resume` = `/sessions`. Click a card to select it. The detail pane is a read-only text area, so you can also drag-select text with the mouse.
 
+## Multi-step tasks
+
+A request can carry `steps: [{"name": ..., "cmd": [...], "cwd": ...}]` instead of a single `cmd`. The bridge runs them sequentially inside one task card, stops at the first failing step, and reports per-step outcomes. The card shows `▸ 2/4 · step name` live; the result summary reads `ok · 4/4 steps` or `failed at step 2/4 (name): reason`. Plain single-command requests are unchanged.
+
 ## Roadmap ideas
 
 - True PTY streaming for interactive commands

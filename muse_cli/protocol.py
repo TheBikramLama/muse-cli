@@ -8,10 +8,16 @@ Two-way bridge:
 Request::
     {"id": str, "task": str, "cmd": [str, ...], "cwd": str|None,
      "timeout": int|None, "source": "muse"|"local", "reveal": bool,
-     "submitted_at": float}
+     "submitted_at": float,
+     "steps": [{"name": str, "cmd": [str, ...], "cwd": str|None}] | None}
 
 `task` is the human summary shown in the TUI ("Sync feature branch"),
 `cmd` stays hidden unless revealed. `reveal: true` shows commands immediately.
+
+Multi-step: instead of a single `cmd`, a request may carry `steps`. The
+bridge runs them sequentially inside one task card, stops at the first
+failing step, and reports per-step outcomes in the result's `steps` array.
+Each step's `cwd` defaults to the request's `cwd`.
 """
 from __future__ import annotations
 

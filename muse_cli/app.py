@@ -74,13 +74,17 @@ class TaskCard(Vertical):
     """One unit of work."""
 
     def __init__(self, rid: str, task: str, source: str,
-                 cmd: list, cwd: str | None, restore_rec: dict | None = None) -> None:
+                 cmd: list, cwd: str | None,
+                 restore_rec: dict | None = None,
+                 steps: list | None = None) -> None:
         super().__init__(classes="task-card")
         self.rid = rid
         self.task_text = task or "(no description)"
         self.source = source
         self.cmd = cmd or []
         self.cwd = cwd or "~"
+        self.steps = steps or []
+        self._step_text = ""
         self.t0 = time.time()
         self.done = False
         self.result: dict | None = None
@@ -125,6 +129,17 @@ class TaskCard(Vertical):
         if self._composed:
             self.live.update("starting…")
 
+    def set_step(self, i: int, n: int, name: str) -> None:
+        self._step_text = f"\u25b8 {i}/{n} \u00b7 {name}"
+        self._render_live()
+
+    def _render_live(self) -> None:
+        if not self._composed:
+            return
+        parts = [self._step_text] if self._step_text else []
+        parts.extend(self._tail)
+        self.live.update("\n".join(parts) if parts else "\u2026")
+
     def push_chunk(self, line: str) -> None:
         if not self._composed:
             return
@@ -133,7 +148,7 @@ class TaskCard(Vertical):
             return
         self._tail.append(line)
         self._tail = self._tail[-3:]
-        self.live.update("\n".join(self._tail))
+        self._render_live()
 
     def tick(self, frame: int) -> None:
         if self.done or not self._composed:
@@ -176,14 +191,22 @@ class TaskCard(Vertical):
         self.mount(self._detail)
 
     def _detail_text(self, res: dict) -> str:
+        if self.steps:
+            first = f"{len(self.steps)} step(s): " + "; ".join(
+                str(s.get("name", "")) for s in self.steps)
+        else:
+            first = f"$ {' '.join(self.cmd)}"
         lines = [
-            f"$ {' '.join(self.cmd)}",
+            first,
             f"in {self.cwd} · {self.source} · {res.get('duration_s', 0):.1f}s",
             f"summary: {res.get('summary') or res.get('error') or ''}",
-            "",
-            "--- stdout ---",
-            res.get("stdout") or "(empty)",
         ]
+        if res.get("steps"):
+            lines.append("")
+            for s in res["steps"]:
+                mark = "✓" if s.get("ok") and (s.get("exit") or 0) == 0 else "✗"
+                lines.append(f"  {mark} {s.get('name')} · {s.get('summary', '')}")
+        lines += ["", "--- stdout ---", res.get("stdout") or "(empty)"]
         if res.get("stderr"):
             lines += ["", "--- stderr ---", res["stderr"]]
         if res.get("truncated"):
@@ -277,6 +300,7 @@ class MuseCliApp(App):
             on_start=self._cb_start,
             on_chunk=self._cb_chunk,
             on_result=self._cb_result,
+            on_step=self._cb_step,
         )
         self._bridge.start()
         self._refresh_statusbar("bridge online")
@@ -311,6 +335,9 @@ class MuseCliApp(App):
     def _cb_result(self, res: dict) -> None:
         self._safe_call(self._on_result, res)
 
+    def _cb_step(self, rid: str, i: int, n: int, name: str) -> None:
+        self._safe_call(self._on_step, rid, i, n, name)
+
     # -- UI-thread handlers --
     def _on_start(self, req: dict) -> None:
         rid = req["id"]
@@ -321,7 +348,8 @@ class MuseCliApp(App):
         if card is None:
             # Submitted externally (e.g. by Muse dropping a file in the queue).
             card = TaskCard(rid, req.get("task", ""), req.get("source", "muse"),
-                            req.get("cmd", []), req.get("cwd"))
+                            req.get("cmd", []), req.get("cwd"),
+                            steps=req.get("steps"))
             self.cards[rid] = card
             self.focused_rid = rid
             self.task_list.mount(card)
@@ -333,6 +361,11 @@ class MuseCliApp(App):
         card = self.cards.get(rid)
         if card is not None:
             card.push_chunk(line)
+
+    def _on_step(self, rid: str, i: int, n: int, name: str) -> None:
+        card = self.cards.get(rid)
+        if card is not None:
+            card.set_step(i, n, name)
 
     def _on_result(self, res: dict) -> None:
         if res.get("source") == "muse":
