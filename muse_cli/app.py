@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import json
+import re
 import shlex
 import subprocess
 import time
@@ -46,6 +47,8 @@ Slash commands (type in the box below):
   /scripts       list scripts in ~/.muse/scripts/
   /settings      show where settings.json lives
   /sessions      list past sessions (most recent first)
+  /session <name> switch the session new tasks are logged to
+  /export [name]  save this session's finished tasks as markdown
   /clear         remove finished task cards
   /help          this help
   /quit          exit
@@ -531,10 +534,61 @@ class MuseCliApp(App):
             self.notify(f"settings: {SETTINGS_PATH}")
         elif name == "sessions":
             self._list_sessions()
+        elif name == "session":
+            if not arg:
+                self.notify(f"current session: {self.session_id}")
+            elif not re.match(r"^[A-Za-z0-9][A-Za-z0-9_-]*$", arg):
+                self.notify("session name: letters, digits, _ and - only")
+            else:
+                self.session_id = arg
+                self._refresh_statusbar()
+                self.notify(f"session → {arg} (new tasks log here)")
+        elif name == "export":
+            self._export_session(arg)
         elif name in ("quit", "q"):
             self.exit()
         else:
             self.notify(f"unknown command: /{name}  (try /help)")
+
+    def _export_session(self, arg: str) -> None:
+        cards = [c for c in self.task_list.query(TaskCard)
+                 if c.done and c.result is not None]
+        if not cards:
+            self.notify("nothing to export")
+            return
+        name = re.sub(r"[^A-Za-z0-9_-]", "-", arg.strip() or
+                      f"session-{self.session_id}")[:60] or "session"
+        ensure_dirs()
+        path = os.path.join(EXPORTS_DIR, f"{name}.md")
+        lines = [f"# muse-cli session {self.session_id}", ""]
+        for card in cards:
+            res = card.result or {}
+            lines.append(f"## {card.task_text}")
+            lines.append("")
+            lines.append(
+                f"- source: {card.source} · cwd: {card.cwd} · "
+                f"{res.get('duration_s', 0):.1f}s · "
+                f"{res.get('summary') or res.get('error') or ''}")
+            if card.steps:
+                lines.append(
+                    f"- {len(card.steps)} step(s): " +
+                    "; ".join(str(s.get("name", "")) for s in card.steps))
+            elif card.cmd:
+                lines.append(f"- `$ {' '.join(card.cmd)}`")
+            out = (res.get("stdout") or "").rstrip()
+            if out:
+                lines += ["", "```", out, "```"]
+            err = (res.get("stderr") or "").rstrip()
+            if err:
+                lines += ["", "stderr:", "```", err, "```"]
+            lines.append("")
+        try:
+            with open(path, "w") as f:
+                f.write("\n".join(lines))
+        except OSError:
+            self.notify("could not export")
+            return
+        self.notify(f"exported {len(cards)} task(s): {path}")
 
     def _list_sessions(self) -> None:
         try:
@@ -769,7 +823,9 @@ class MuseCliApp(App):
 
     def _refresh_statusbar(self, extra: str = "") -> None:
         t = Text()
-        t.append("muse-cli · cwd: ")
+        t.append("muse-cli · ")
+        t.append(self.session_id, style="bold")
+        t.append(" · cwd: ")
         t.append(self.session_cwd)
         t.append(" · bridge ")
         t.append("●", style="green")

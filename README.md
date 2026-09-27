@@ -86,6 +86,10 @@ Slash commands in the input box: `/cd <dir>`, `/run <script>`, `/scripts`, `/set
 - `s` saves a task's detail + full output to `~/.muse/exports/<id>.md`.
 - Set `tui.notify_on_done: true` in `~/.muse/settings.json` for a macOS notification whenever a task finishes.
 
+## Sessions
+
+`/sessions` lists past sessions, `/session <name>` switches the session new tasks are logged to, and `/export [name]` writes the finished tasks as markdown to `~/.muse/exports/`.
+
 ## Queue controls
 
 `p` pauses the bridge (queue held, status bar shows `⏸ paused`); `p` again resumes. `r` retries the selected finished task as a fresh card.
