@@ -36,6 +36,7 @@ from .paths import (EXPORTS_DIR, INPUT_HISTORY_PATH, MESSAGES_DIR, PAUSED_PATH,
 from .protocol import cancel, new_id, submit
 from .runner import check_cwd
 from .sessions import load_recent, log_task, new_session
+from .skills import install_skill, list_skills, read_skill, remove_skill
 
 SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 CHUNK_THROTTLE_S = 0.15
@@ -104,7 +105,8 @@ class TaskCard(Vertical):
     def __init__(self, rid: str, task: str, source: str,
                  cmd: list, cwd: str | None,
                  restore_rec: dict | None = None,
-                 steps: list | None = None) -> None:
+                 steps: list | None = None,
+                 skills: list | None = None) -> None:
         super().__init__(classes="task-card")
         self.rid = rid
         self.task_text = task or "(no description)"
@@ -112,6 +114,7 @@ class TaskCard(Vertical):
         self.cmd = cmd or []
         self.cwd = cwd or "~"
         self.steps = steps or []
+        self.skills = [str(s) for s in (skills or [])]
         self._step_text = ""
         self.t0 = time.time()
         self.done = False
@@ -131,6 +134,8 @@ class TaskCard(Vertical):
             yield self.icon
             yield Static(self.task_text, classes="task-title")
             yield Static(self.source, classes="task-src")
+            if self.skills:
+                yield Static("⚙ " + ",".join(self.skills), classes="task-src")
             self.elapsed = Static("", classes="task-elapsed")
             yield self.elapsed
         self.live = Static("queued…", classes="live-line")
@@ -478,7 +483,8 @@ class MuseCliApp(App):
         for rec in load_recent(self.settings.get("tui", {}).get("history_limit", 50)):
             card = TaskCard(rec.get("id", "?"), rec.get("task", ""),
                             rec.get("source", "muse"), rec.get("cmd", []),
-                            rec.get("cwd"), restore_rec=rec)
+                            rec.get("cwd"), restore_rec=rec,
+                            skills=rec.get("skills"))
             self.cards[card.rid] = card
             self.task_list.mount(card)
         self._render_message_history()
@@ -550,7 +556,7 @@ class MuseCliApp(App):
             # Submitted externally (e.g. by Muse dropping a file in the queue).
             card = TaskCard(rid, req.get("task", ""), req.get("source", "muse"),
                             req.get("cmd", []), req.get("cwd"),
-                            steps=req.get("steps"))
+                            steps=req.get("steps"), skills=req.get("skills"))
             self.cards[rid] = card
             self.focused_rid = rid
             self.task_list.mount(card)
@@ -574,7 +580,7 @@ class MuseCliApp(App):
         if card is None:
             card = TaskCard(rid, req.get("task", ""), req.get("source", "muse"),
                             req.get("cmd", []), req.get("cwd"),
-                            steps=req.get("steps"))
+                            steps=req.get("steps"), skills=req.get("skills"))
             self.cards[rid] = card
             self.focused_rid = rid
             self.task_list.mount(card)
@@ -705,6 +711,59 @@ class MuseCliApp(App):
             lines.append(f"  {name} · {card.progress_text or '?'}")
         self.task_list.mount(Static("\n".join(lines), classes="help-card"))
         self.task_list.scroll_end(animate=False)
+
+    def _list_skills(self) -> None:
+        skills = list_skills()
+        if not skills:
+            self.notify("no skills installed — /skill install <git-url|path>")
+            return
+        in_use: set[str] = set()
+        for card in self.cards.values():
+            if not card.done:
+                in_use.update(card.skills)
+        lines = ["skills:"]
+        for s in skills:
+            mark = "●" if s["name"] in in_use else "○"
+            desc = f" — {s['description']}" if s["description"] else ""
+            lines.append(f"  {mark} {s['name']}{desc}")
+        lines.append("● in use · ○ installed")
+        self.task_list.mount(Static("\n".join(lines), classes="help-card"))
+        self.task_list.scroll_end(animate=False)
+
+    def _skill_cmd(self, arg: str) -> None:
+        parts = arg.split(None, 1)
+        sub = parts[0] if parts else ""
+        rest = parts[1] if len(parts) > 1 else ""
+        if sub == "install":
+            src = rest.strip()
+            if not src:
+                self.notify("usage: /skill install <git-url|path>")
+                return
+            self.notify(f"installing skill from {src}…")
+
+            def _do() -> None:
+                ok, msg = install_skill(src)
+                try:
+                    self.call_from_thread(self.notify,
+                                          ("✓ " if ok else "✗ ") + msg)
+                except RuntimeError:
+                    pass
+
+            threading.Thread(target=_do, daemon=True).start()
+        elif sub == "remove":
+            self.notify(remove_skill(rest)[1])
+        elif sub == "show":
+            name = rest.strip()
+            content = read_skill(name)
+            if content is None:
+                self.notify(f"no such skill: {name or '?'} (see /skills)")
+            else:
+                self.task_list.mount(
+                    Static(f"skill: {name}\n\n{content}", classes="help-card"))
+                self.task_list.scroll_end(animate=False)
+        else:
+            self.notify("usage: /skill install <git-url|path> | "
+                        "/skill remove <name> | /skill show <name>")
 
     def _render_message_history(self) -> None:
         """Show recent messages/replies as history on startup (max 30)."""
@@ -931,6 +990,10 @@ class MuseCliApp(App):
                 else:
                     card.scroll_visible()
                     self.notify(f"todo: {key} · {card.progress_text}")
+        elif name == "skills":
+            self._list_skills()
+        elif name == "skill":
+            self._skill_cmd(arg)
         elif name == "autoapprove":
             if not arg:
                 self._set_auto_approve(not self.settings.get("auto_approve", False))

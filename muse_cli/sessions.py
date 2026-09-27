@@ -40,6 +40,7 @@ def log_task(sid: str, res: dict) -> None:
         "exit": res.get("exit"),
         "duration_s": res.get("duration_s", 0),
         "summary": res.get("summary") or res.get("error") or "",
+        "skills": res.get("skills", []),
     })
 
 

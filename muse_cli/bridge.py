@@ -214,6 +214,8 @@ class Bridge:
             res["error"] = "cancelled"
             res["summary"] = "cancelled"
             res["exit"] = None
+        if req.get("skills"):
+            res["skills"] = list(req["skills"])
         write_result(res)
         _call(self.on_result, res)
 
