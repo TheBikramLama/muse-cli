@@ -94,6 +94,14 @@ Slash commands in the input box: `/cd <dir>`, `/run <script>`, `/scripts`, `/set
 
 `p` pauses the bridge (queue held, status bar shows `⏸ paused`); `p` again resumes. `r` retries the selected finished task as a fresh card.
 
+## Background daemon & single instance
+
+Only one bridge (TUI or daemon) runs at a time — the first one claims `~/.muse/muse-cli.pid`, and a second start exits instead of double-running the queue.
+
+- `./run.sh --daemon` runs the bridge headless (plain stdout logging).
+- `./run.sh --install-launchd` installs it as a macOS LaunchAgent (`com.muse.cli`, logs to `~/.muse/daemon.log`); `--uninstall-launchd` removes it.
+- While the daemon runs, the TUI refuses to start — unload the daemon first to use the TUI.
+
 ## Approvals
 
 A request with `"needs_approval": true` is parked in `~/.muse/approval/` instead of running. The TUI shows it as `⏸ awaiting approval` — press `a` to approve (it queues and runs) or `d` to deny (`denied by user` result). Parked requests survive a restart and reappear on launch. (Headless `--daemon` can't approve; requests just wait.)

@@ -15,6 +15,7 @@ APPROVAL_DIR = os.path.join(MUSE_HOME, "approval")
 EXPORTS_DIR = os.path.join(MUSE_HOME, "exports")
 SETTINGS_PATH = os.path.join(MUSE_HOME, "settings.json")
 PAUSED_PATH = os.path.join(MUSE_HOME, "paused")  # file, not dir: bridge holds the queue while it exists
+PID_PATH = os.path.join(MUSE_HOME, "muse-cli.pid")  # single-instance guard
 INPUT_HISTORY_PATH = os.path.join(MUSE_HOME, "input_history")
 
 ALL_DIRS = [QUEUE_DIR, RESULTS_DIR, SESSIONS_DIR, SKILLS_DIR, SCRIPTS_DIR,
