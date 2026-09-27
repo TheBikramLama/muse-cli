@@ -28,7 +28,7 @@ from textual.widgets import Footer, Header, Input, Static, TextArea
 
 from .bridge import Bridge
 from .config import load_settings
-from .paths import SCRIPTS_DIR, SESSIONS_DIR, SETTINGS_PATH
+from .paths import PAUSED_PATH, SCRIPTS_DIR, SESSIONS_DIR, SETTINGS_PATH
 from .protocol import cancel, submit
 from .sessions import load_recent, log_task, new_session
 
@@ -55,6 +55,8 @@ Keys (when the input box is not focused — press Esc to leave it):
   /   jump back to the input box
   c   show/hide the selected task's commands + full output
   x   cancel the selected (or currently running) task
+  p   pause/resume the bridge queue
+  r   retry the selected finished task
   a   approve the selected task (when awaiting approval)
   d   deny the selected task (when awaiting approval)
   y   copy the selected task's detail to the clipboard
@@ -301,6 +303,8 @@ class MuseCliApp(App):
         ("x", "cancel_task", "Cancel"),
         ("a", "approve_task", "Approve"),
         ("d", "deny_task", "Deny"),
+        ("p", "toggle_pause", "Pause"),
+        ("r", "retry_task", "Retry"),
         ("y", "copy_task", "Copy"),
         ("g", "scroll_bottom", "Bottom"),
     ]
@@ -629,6 +633,39 @@ class MuseCliApp(App):
         else:
             self.notify("approval expired")
 
+    def action_toggle_pause(self) -> None:
+        if os.path.exists(PAUSED_PATH):
+            try:
+                os.remove(PAUSED_PATH)
+            except OSError:
+                pass
+            self.notify("bridge resumed — queue flowing")
+        else:
+            try:
+                with open(PAUSED_PATH, "w") as f:
+                    f.write("")
+            except OSError:
+                self.notify("could not pause")
+                return
+            self.notify("bridge paused — queue held")
+        self._refresh_statusbar()
+
+    def action_retry_task(self) -> None:
+        card = self.cards.get(self.focused_rid or "")
+        if card is None or not card.done:
+            self.notify("select a finished task to retry")
+            return
+        rid = submit(task=card.task_text, cmd=card.cmd, cwd=card.cwd,
+                     source="local", steps=card.steps or None)
+        new_card = TaskCard(rid, card.task_text, "local", card.cmd,
+                            card.cwd, steps=card.steps)
+        self.cards[rid] = new_card
+        self.focused_rid = rid
+        self.task_list.mount(new_card)
+        self.task_list.scroll_end(animate=False)
+        self.refresh_selection()
+        self.notify("retried")
+
     def action_cancel_task(self) -> None:
         card = self.cards.get(self.focused_rid or "")
         if card is None or card.done:
@@ -664,6 +701,8 @@ class MuseCliApp(App):
             t.append("● working", style="green")
         else:
             t.append("○ idle", style="dim")
+        if os.path.exists(PAUSED_PATH):
+            t.append(" · ⏸ paused", style="yellow")
         if extra:
             t.append(f" · {extra}")
         self.statusbar.update(t)

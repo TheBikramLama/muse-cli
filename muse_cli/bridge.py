@@ -20,7 +20,7 @@ import threading
 import time
 
 from .config import load_settings
-from .paths import APPROVAL_DIR, CANCEL_DIR, QUEUE_DIR, ensure_dirs
+from .paths import APPROVAL_DIR, CANCEL_DIR, PAUSED_PATH, QUEUE_DIR, ensure_dirs
 from .protocol import write_result
 from .runner import run_request, run_steps
 
@@ -122,6 +122,8 @@ class Bridge:
 
     def _drain(self) -> None:
         ensure_dirs()
+        if os.path.exists(PAUSED_PATH):
+            return  # paused: hold the queue, keep processing cancels
         try:
             names = sorted(os.listdir(QUEUE_DIR))
         except OSError:
