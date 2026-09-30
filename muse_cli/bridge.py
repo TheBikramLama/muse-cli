@@ -38,6 +38,15 @@ def _rm(path: str) -> None:
         pass
 
 
+def _short_cmd(cmd) -> str:
+    """A human step label from a raw command list (no more 'step 3')."""
+    if isinstance(cmd, (list, tuple)):
+        text = " ".join(str(c) for c in cmd).strip()
+    else:
+        text = str(cmd or "").strip()
+    return text[:48] + ("…" if len(text) > 48 else "")
+
+
 def _cancelled_result(req: dict) -> dict:
     now = time.time()
     return {
@@ -83,6 +92,13 @@ class Bridge:
         self._attempts: dict[str, int] = {}
         self._procs: dict[str, object] = {}
         self._cancelled: set[str] = set()
+        self._auto_paths: dict[str, str] = {}
+        self._auto_lock = threading.Lock()
+
+    def live_auto_rids(self) -> set:
+        """Request ids this bridge is currently running (todo sweep skip-list)."""
+        with self._auto_lock:
+            return set(self._auto_paths)
 
     # -- lifecycle --
     def start(self) -> None:
@@ -260,10 +276,15 @@ class Bridge:
             if isinstance(raw_steps, list):
                 for i, s in enumerate(raw_steps, 1):
                     if isinstance(s, dict):
-                        step_names.append(s.get("name") or f"step {i}")
+                        label = (s.get("name") or s.get("label")
+                                 or _short_cmd(s.get("cmd")))
+                        step_names.append(label or f"step {i}")
             title = (req.get("task") or " ".join(req.get("cmd", []) or [])
                      or rid)
-            auto_todo.create(rid, title, step_names)
+            auto_path = auto_todo.create(
+                rid, title, step_names, owner=f"bridge:{self.session}")
+            with self._auto_lock:
+                self._auto_paths[rid] = auto_path
 
             def _chunk(line: str) -> None:
                 _call(self.on_chunk, rid, line)
@@ -274,7 +295,7 @@ class Bridge:
             def _step(i: int, n: int, name: str) -> None:
                 _call(self.on_step, rid, i, n, name)
                 # on_step fires when step i *starts*: steps before it are done.
-                auto_todo.advance(rid, i - 1)
+                auto_todo.advance(self._auto_paths.get(rid, ""), i - 1)
 
             try:
                 res = run_steps(req, self.settings, on_chunk=_chunk, on_proc=_got_proc,
@@ -295,7 +316,9 @@ class Bridge:
                 note = ("cancelled" if res.get("error") == "cancelled"
                         else (res.get("summary") or res.get("error")
                               or "failed"))
-            auto_todo.finish(rid, ok, note)
+            with self._auto_lock:
+                done_path = self._auto_paths.pop(rid, "")
+            auto_todo.finish(done_path, ok, note)
             if req.get("skills"):
                 res["skills"] = list(req["skills"])
             write_result(res)

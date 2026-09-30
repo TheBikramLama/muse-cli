@@ -12,6 +12,31 @@ from .paths import DEFAULT_SESSION
 
 
 def main() -> None:
+    # Agent companion heartbeat: `muse-cli report --agent <id>
+    # --task "..." --status "..."` drops ~/.muse/activity/<id>.json so the
+    # TUI shows live agent presence (see muse_cli/activity.py).
+    if len(sys.argv) > 1 and sys.argv[1] == "report":
+        from .activity import clear, report
+        rp = argparse.ArgumentParser(
+            prog="muse-cli report",
+            description="Heartbeat agent activity to the TUI dashboard.")
+        rp.add_argument("--agent", required=True,
+                        help="stable agent id, e.g. side-chat:<id>")
+        rp.add_argument("--task", default="", help="what the task is")
+        rp.add_argument("--status", default="",
+                        help="what you are doing right now")
+        rp.add_argument("--todo", default="",
+                        help="your todo filename under ~/.muse/todos/")
+        rp.add_argument("--label", default="", help="short display label")
+        rp.add_argument("--done", action="store_true",
+                        help="remove this agent's report")
+        rargs = rp.parse_args(sys.argv[2:])
+        if rargs.done:
+            clear(rargs.agent)
+        else:
+            print(report(rargs.agent, task=rargs.task, status=rargs.status,
+                         todo=rargs.todo, label=rargs.label))
+        return
     # Subcommands: `muse-cli setup`, `muse-cli doctor`, `muse-cli pair`,
     # `muse-cli unpair`.
     if len(sys.argv) > 1 and sys.argv[1] in ("setup", "doctor", "pair", "unpair"):

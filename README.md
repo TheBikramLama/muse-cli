@@ -184,7 +184,13 @@ The input box routes on its first character:
 
 ## Todo lists
 
-Muse can drop Markdown checklists into `~/.muse/todos/<name>.md`. The TUI watches the directory (~1/s) and renders each file as a live card: the Markdown body plus checkbox progress (`- [x]` counts as done, shown as `n/m`). `/todos` lists them, `/todo <name>` jumps to one.
+Muse can drop Markdown checklists into `~/.muse/todos/<name>.md`. The TUI watches the directory (~1/s) and renders each file as a live card: the Markdown body plus checkbox progress (`- [x]` counts as done, shown as `n/m`). `/todos` lists them, `/todo <name>` jumps to one. Click a checklist row to toggle it.
+
+Bridge tasks auto-create `_auto_<slug>-<id>.md` (human `# title` shown in the sidebar, never the filename). Lists are leased: anything nobody touched for 30 minutes is swept automatically — halted agents and deleted side-chats leave nothing behind. Completed lists linger ~5 minutes, then vanish on their own.
+
+## Agent presence (mission control)
+
+The bridge only sees terminal commands. Agents heartbeat everything else with `muse-cli report --agent <id> --task "..." --status "..." [--todo <file>]` — the TUI shows live agents in the activity line (`⚡ label · status · 4m`) and a `⚡ agents` sidebar panel with elapsed time; click a row for task detail and checklist progress. Reporting also heartbeats the named todo file. Quiet for 15 minutes = dropped from the UI. See `PROTOCOL.md` for the full agent contract.
 
 ## Auto-approve
 

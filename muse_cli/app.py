@@ -34,7 +34,8 @@ from textual.widgets import (Footer, Input, Label, ListItem, ListView,
                               Markdown, Static, TextArea)
 
 from .bridge import CLAIM_SUFFIX, Bridge
-from .auto_todo import AUTO_PREFIX
+from . import activity, auto_todo
+from .auto_todo import AUTO_PREFIX, is_auto as _is_auto_todo
 from .config import load_settings, save_settings
 from . import pairing
 from .instance import pid_alive
@@ -563,6 +564,17 @@ def _parse_todo(text: str) -> tuple[int, int, list[tuple[bool, str]]]:
     return done, len(items), items
 
 
+def _pretty_todo_name(name: str) -> str:
+    """Human label for a todo file: the slug words of an _auto_ name,
+    otherwise the filename stem with separators as spaces."""
+    short = name[:-3] if name.endswith(".md") else name
+    if short.startswith(AUTO_PREFIX):
+        rest = short[len(AUTO_PREFIX):]
+        slug = rest.rsplit("-", 1)[0] if "-" in rest else rest
+        return slug.replace("-", " ").strip() or short
+    return short.replace("-", " ").replace("_", " ")
+
+
 class CmdInput(Input):
     """The command box, with completion-dropdown key handling.
 
@@ -631,6 +643,44 @@ class TodoHead(Static):
         app = self.app
         if isinstance(app, MuseCliApp):
             app.expand_todo(self.tname)
+
+
+class TodoItem(Static):
+    """One clickable checklist row in the sidebar.
+
+    Clicking toggles its checkbox (the file is the source of truth).
+    Bridge-owned lists only ever gain checks from the bridge — a manual
+    toggle is never unchecked by it.
+    """
+
+    def __init__(self, name: str, idx: int, checked: bool,
+                 label: str) -> None:
+        super().__init__("",
+                         classes="todo-item done" if checked else "todo-item")
+        self.tname = name
+        self.idx = idx
+        self.update(f"{'☑' if checked else '☐'} {label}")
+
+    def on_click(self, event: events.Click) -> None:
+        app = self.app
+        if isinstance(app, MuseCliApp):
+            app.toggle_todo_item(self.tname, self.idx)
+
+
+class AgentHead(Static):
+    """One clickable agent row in the sidebar.
+
+    Clicking expands the agent's current task, status and checklist.
+    """
+
+    def __init__(self, aid: str) -> None:
+        super().__init__("", classes="todo-head")
+        self.aid = aid
+
+    def on_click(self, event: events.Click) -> None:
+        app = self.app
+        if isinstance(app, MuseCliApp):
+            app.expand_agent(self.aid)
 
 
 class MuseCommands(Provider):
@@ -822,6 +872,12 @@ class MuseCliApp(App):
         self._todo_data: dict[str, dict] = {}
         self._todo_expanded: str | None = None
         self._sidebar_key: object = None
+        # Agent activity reports (~/.muse/activity/*.json): live companion
+        # presence — who is working on what, pushed by the agents
+        # themselves (see muse_cli/activity.py).
+        self._agent_data: dict[str, dict] = {}
+        self._agent_expanded: str | None = None
+        self._agents_key: object = None
         # Watcher visibility: last ~/.muse/watcher.json payload (None = never
         # seen) plus outgoing message cards by mid for status updates.
         self._watcher: dict | None = None
@@ -851,6 +907,8 @@ class MuseCliApp(App):
     def notify(self, message: object, *, title: str = "",
                severity: str = "information", timeout: float = 4) -> None:
         """Show a toast top-right. Thread-safe; replaces App.notify."""
+        if not self.is_running:
+            return
         try:
             self.call_from_thread(self._show_toast, str(message), title,
                                   severity, timeout)
@@ -928,7 +986,6 @@ class MuseCliApp(App):
             "no tasks yet — /help for commands · ! for shell · plain text messages Muse",
             id="empty")
         self.task_list.mount(self.empty_state)
-        self.todoside.mount(Static("☑ todo lists", classes="todo-side-head"))
         self._refresh_sidebar()
         for rec in load_recent(self.settings.get("tui", {}).get("history_limit", 50)):
             card = TaskCard(rec.get("id", "?"), rec.get("task", ""),
@@ -964,6 +1021,11 @@ class MuseCliApp(App):
 
     # -- bridge callbacks (run on worker threads) --
     def _safe_call(self, fn, *args) -> None:
+        if not self.is_running:
+            # A worker thread that outlives app shutdown must not schedule
+            # onto a dead loop: Textual would orphan the callback coroutine
+            # (RuntimeWarning) and the thread would block in future.result().
+            return
         try:
             self.call_from_thread(fn, *args)
         except RuntimeError:
@@ -1078,6 +1140,7 @@ class MuseCliApp(App):
             self._poll_todos()
             self._poll_watcher()
             self._poll_tui_cmd()
+            self._poll_activity()
         if self._poll_n % 100 == 0:  # ~10s: staleness is time-based, so the
             self._refresh_statusbar()  # watcher segment needs a periodic nudge
 
@@ -1189,11 +1252,44 @@ class MuseCliApp(App):
         for mid, card in self._msg_cards.items():
             card.set_status(self._msg_status(mid))
 
+    # -- agents: ~/.muse/activity/*.json, pushed by the agents themselves --
+    def _poll_activity(self) -> None:
+        self._agent_data = activity.read_all()
+        # A report naming a todo file heartbeats it (see auto_todo): an
+        # agent that keeps talking keeps its checklist alive.
+        for rec in self._agent_data.values():
+            todo = rec.get("todo") or ""
+            if todo and _is_auto_todo(os.path.basename(todo)):
+                p = os.path.join(TODOS_DIR, os.path.basename(todo))
+                if os.path.isfile(p):
+                    auto_todo.touch(p)
+        if self._agent_expanded not in self._agent_data:
+            self._agent_expanded = None
+
+    def _live_agents(self) -> list[tuple[str, dict]]:
+        """Agents worth showing, freshest first."""
+        recs = list(self._agent_data.items())
+        recs.sort(key=lambda kv: kv[1].get("at", 0), reverse=True)
+        return recs
+
+    def expand_agent(self, aid: str) -> None:
+        """Expand one agent row in the sidebar, collapsing the others."""
+        if aid in self._agent_data:
+            self._agent_expanded = aid
+            self._refresh_sidebar()
+
     # -- todos: ~/.muse/todos/*.md watched live --
     def _poll_todos(self) -> None:
         # Todo lists live ONLY in the sidebar now — no chat cards.
         # Files under ~/.muse/todos/*.md are the source of truth.
         ensure_dirs()
+        if self._poll_n % 300 == 0:  # ~30s: sweep finished & abandoned lists
+            auto_todo.sweep_completed()
+            # Never sweep tasks this bridge is actively running, even if
+            # their file went quiet mid-command.
+            live = (self._bridge.live_auto_rids()
+                    if getattr(self, "_bridge", None) else set())
+            auto_todo.sweep_abandoned(live_rids=live)
         try:
             names = sorted(f for f in os.listdir(TODOS_DIR)
                            if f.endswith(".md"))
@@ -1214,8 +1310,19 @@ class MuseCliApp(App):
                 except OSError:
                     continue
                 done, total, items = _parse_todo(text)
+                title = ""
+                t0 = 0.0
+                owner = ""
+                if _is_auto_todo(name):
+                    info = auto_todo.parse(p)
+                    if info:
+                        title = info["title"]
+                        t0 = info["t0"]
+                        owner = info["owner"]
                 self._todo_data[name] = {"mtime": mtime, "done": done,
-                                         "total": total, "items": items}
+                                         "total": total, "items": items,
+                                         "title": title, "t0": t0,
+                                         "owner": owner}
             seen.add(name)
         for name in list(self._todo_data):
             if name not in seen:
@@ -1329,7 +1436,10 @@ class MuseCliApp(App):
         # The 1s poll calls this constantly; only rebuild the DOM when the
         # underlying data changed, so clicks land on stable widgets.
         key = (tuple(sorted((n, r["mtime"]) for n, r in self._todo_data.items())),
-               self._todo_expanded)
+               self._todo_expanded,
+               tuple(sorted((a, round(r.get("at", 0)))
+                             for a, r in self._agent_data.items())),
+               self._agent_expanded)
         if key != self._sidebar_key:
             self._sidebar_key = key
             for sec in list(side.query(".todo-sec")):
@@ -1337,24 +1447,14 @@ class MuseCliApp(App):
                     sec.remove()
                 except Exception:
                     pass
-            for name in sorted(self._todo_data):
-                rec = self._todo_data[name]
-                expanded = name == self._todo_expanded
-                sec = Vertical(classes="todo-sec")
-                side.mount(sec)
-                head = TodoHead(name)
-                head.update(self._todo_head_text(
-                    name, rec["done"], rec["total"], expanded))
-                sec.mount(head)
-                if expanded:
-                    for checked, label in rec["items"]:
-                        mark = "☑" if checked else "☐"
-                        sec.mount(Static(
-                            f"{mark} {label}",
-                            classes="todo-item done" if checked else "todo-item"))
-                    if not rec["items"]:
-                        sec.mount(Static("(empty)", classes="todo-item done"))
-        visible = (self._has_active_todos()
+            for w in list(side.query(".todo-side-head")):
+                try:
+                    w.remove()
+                except Exception:
+                    pass
+            self._render_agents(side)
+            self._render_todos(side)
+        visible = ((self._has_active_todos() or self._agent_data)
                    and not self._sidebar_manual_hide
                    and (self._sidebar_fits()
                         or self._sidebar_manual_show))
@@ -1363,6 +1463,57 @@ class MuseCliApp(App):
         except Exception:
             pass
         self._refresh_activity()
+
+    def _render_agents(self, side) -> None:
+        agents = self._live_agents()
+        if not agents:
+            return
+        side.mount(Static("⚡ agents", classes="todo-side-head"))
+        for aid, rec in agents:
+            live = rec.get("live")
+            sec = Vertical(classes="todo-sec")
+            side.mount(sec)
+            head = AgentHead(aid)
+            t = Text()
+            t.append("● " if live else "◐ ",
+                     style="green" if live else "dim")
+            t.append((rec.get("label") or aid)[:22])
+            el = rec.get("elapsed", 0)
+            t.append(f" · {el / 60:.0f}m" if el >= 60 else f" · {el:.0f}s",
+                     style="dim")
+            head.update(t)
+            sec.mount(head)
+            if aid == self._agent_expanded:
+                if rec.get("task"):
+                    sec.mount(Static(f"  {rec['task']}", classes="todo-item"))
+                if rec.get("status"):
+                    sec.mount(Static(f"  → {rec['status']}",
+                                     classes="todo-item"))
+                todo = rec.get("todo") or ""
+                td = self._todo_data.get(todo)
+                if td:
+                    sec.mount(Static(
+                        f"  ☑ {td['done']}/{td['total']} "
+                        f"{(td.get('title') or todo)[:24]}",
+                        classes="todo-item"))
+
+    def _render_todos(self, side) -> None:
+        if not self._todo_data:
+            return
+        side.mount(Static("☑ todo lists", classes="todo-side-head"))
+        for name in sorted(self._todo_data):
+            rec = self._todo_data[name]
+            expanded = name == self._todo_expanded
+            sec = Vertical(classes="todo-sec")
+            side.mount(sec)
+            head = TodoHead(name)
+            head.update(self._todo_head_text(name, rec, expanded))
+            sec.mount(head)
+            if expanded:
+                for idx, (checked, label) in enumerate(rec["items"]):
+                    sec.mount(TodoItem(name, idx, checked, label))
+                if not rec["items"]:
+                    sec.mount(Static("(empty)", classes="todo-item done"))
 
     def _sidebar_fits(self) -> bool:
         """Whether the terminal is wide enough for the todo sidebar."""
@@ -1375,13 +1526,16 @@ class MuseCliApp(App):
         # Re-evaluate the narrow-screen sidebar auto-hide.
         self._refresh_sidebar()
 
-    def _todo_head_text(self, name: str, done: int, total: int,
-                        expanded: bool) -> Text:
+    def _todo_head_text(self, name: str, rec: dict, expanded: bool) -> Text:
         t = Text()
-        short = name[:-3] if name.endswith(".md") else name
+        title = rec.get("title") or _pretty_todo_name(name)
         t.append("▾ " if expanded else "▸ ", style="dim")
-        t.append(short[:24])
-        t.append(f"  {done}/{total}", style="dim")
+        t.append(title[:30])
+        t.append(f"  {rec['done']}/{rec['total']}", style="dim")
+        if rec["done"] < rec["total"] and rec.get("t0"):
+            el = time.time() - rec["t0"]
+            if el >= 60:
+                t.append(f" · {el / 60:.0f}m", style="dim")
         return t
 
     def expand_todo(self, name: str) -> None:
@@ -1389,6 +1543,17 @@ class MuseCliApp(App):
         if name in self._todo_data:
             self._todo_expanded = name
             self._refresh_sidebar()
+
+    def toggle_todo_item(self, name: str, idx: int) -> None:
+        """Click a checklist row: flip its checkbox in the file."""
+        state = auto_todo.toggle_item(os.path.join(TODOS_DIR, name), idx)
+        if state is None:
+            self.notify(f"no todo list: {name} (see /todos)")
+            return
+        rec = self._todo_data.get(name)
+        if rec is not None:
+            rec["mtime"] = 0  # force a re-read on the next poll
+        self._poll_todos()
 
     def _clear_todos(self, name: str) -> None:
         """Delete todo list file(s): `/todo clear <name>` removes one list,
@@ -1502,6 +1667,8 @@ class MuseCliApp(App):
 
             def _do() -> None:
                 ok, msg = install_skill(src)
+                if not self.is_running:
+                    return
                 try:
                     self.call_from_thread(self.notify,
                                           ("✓ " if ok else "✗ ") + msg)
@@ -1861,6 +2028,8 @@ class MuseCliApp(App):
                                      exit_code=exit_code,
                                      output="".join(chunks), error=reason,
                                      truncated=truncated)
+            if not self.is_running:
+                return
             try:
                 self.call_from_thread(self._shell_done, rid, res)
             except RuntimeError:
@@ -2573,11 +2742,26 @@ class MuseCliApp(App):
             t.append(f"◷ {waiting} awaiting approval — a approve · d deny",
                      style="yellow")
         else:
-            ext = self._external_activity_text()
-            if ext is not None:
-                t = ext
+            live_agents = [a for a in self._live_agents() if a[1].get("live")]
+            if live_agents:
+                aid, rec = live_agents[0]
+                el = rec.get("elapsed", 0)
+                t.append("⚡ ", style="yellow")
+                t.append((rec.get("label") or aid)[:24], style="yellow")
+                status = (rec.get("status") or rec.get("task") or "")[:40]
+                if status:
+                    t.append(" · ", style="dim")
+                    t.append(status, style="dim")
+                t.append(f" · {el / 60:.0f}m" if el >= 60 else f" · {el:.0f}s",
+                         style="dim")
+                if len(live_agents) > 1:
+                    t.append(f" · +{len(live_agents) - 1} more", style="dim")
             else:
-                t.append("○ Idle", style="dim")
+                ext = self._external_activity_text()
+                if ext is not None:
+                    t = ext
+                else:
+                    t.append("○ Idle", style="dim")
         try:
             self.activity_left.update(t)
             # Mini todo summary on the right, above the message box.
@@ -2645,11 +2829,14 @@ class MuseCliApp(App):
             elif name.endswith(".json"):
                 queued += 1
         # 3. agent-pushed status lines for tasks we have no card for.
+        # Stale files (a dead agent never cleaned up) are ignored — a
+        # status line older than 10 minutes is not "working".
         status: list[tuple[float, str, str]] = []  # (mtime, rid, last line)
         try:
             sfiles = os.listdir(STATUS_DIR)
         except OSError:
             sfiles = []
+        now = time.time()
         for f in sfiles:
             if not f.endswith(".txt") or f[:-4] in own:
                 continue
@@ -2659,6 +2846,8 @@ class MuseCliApp(App):
                     lines = [ln.strip() for ln in fh if ln.strip()]
                 mt = os.path.getmtime(p)
             except OSError:
+                continue
+            if now - mt > 600:
                 continue
             if lines:
                 status.append((mt, f[:-4], lines[-1]))

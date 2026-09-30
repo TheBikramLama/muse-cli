@@ -93,18 +93,49 @@ realtime view of your progress — **update them as you go**, don't just report
 at the end.
 
 - **Bridge tasks:** when your request starts, the bridge auto-creates
-  `~/.muse/todos/_auto_<task_id>.md` from your request's `steps` (a single
+  `~/.muse/todos/_auto_<slug>-<id>.md` from your request's `steps` (a single
   item for a plain command) and checks items off as steps complete. For
   finer-grained progress, rewrite the same file yourself, flipping
-  `- [ ]` to `- [x]` as you finish things. Use the **same `<task_id>`** as
-  your queued request. Never touch another task's `_auto_` file.
+  `- [ ]` to `- [x]` as you finish things. Find yours by the
+  `<!-- auto:rid=<your-task-id> -->` marker. Never touch another task's
+  `_auto_` file.
 - **Conversational work** (no bridge request): create your own
-  `~/.muse/todos/<short-name>.md` and keep it current.
-- Format: `# Title` on the first line, then `- [ ]` / `- [x]` lines.
+  `~/.muse/todos/_auto_<slug>-<your-id>.md` with a first line of
+  `<!-- auto:rid=<your-id> owner=<your-agent-id> t0=<epoch> -->` followed by
+  `# Your task title`. The sidebar shows the `# title` — write a real one,
+  and write real step labels (never "step 1", "step 2").
+- Format: `# Title` under the marker line, then `- [ ]` / `- [x]` lines.
   Parallel agents use separate files — never merge two tasks into one list.
-- When your work finishes, check everything off. Don't leave a stale `2/4`:
-  fully-checked auto lists linger (visible `4/4`) until the next task starts;
-  failed or partial ones stay until the user runs `/todo clear`.
+- **Heartbeat:** the file's mtime is your lease. Touch it (any update
+  counts) at least every few minutes while the task is live — an activity
+  report naming the file does this for you. A list nobody touched for 30
+  minutes is treated as abandoned and swept automatically.
+- **When done:** append `<!-- auto:done=ok -->` (or just delete the file).
+  Don't leave a stale `2/4`. Completed lists linger ~5 minutes for
+  visibility, then vanish on their own.
+
+## Activity reports — be visible while you work (companion, not terminal)
+
+The bridge only sees terminal commands. File reads, edits, thinking —
+none of it reaches the TUI unless you say something. Say something:
+
+```bash
+muse-cli report --agent <your-agent-id> --task "Fixing dashboard drag" \
+  --status "editing DashboardPage.tsx" --todo _auto_<slug>-<id>.md
+```
+
+(or drop the same JSON at `~/.muse/activity/<agent-id>.json` yourself:
+`{"agent": ..., "label": ..., "task": ..., "status": ..., "todo": ...,
+"t0": <epoch>, "at": <epoch>}`).
+
+- Re-run it as your status changes (at least every couple of minutes).
+  Fresh reports (< 2 min) render live in the activity line and the
+  ⚡ agents sidebar panel, with elapsed time.
+- `--todo` heartbeats your checklist (see above).
+- Going quiet for 15 minutes drops you from the UI; `--done` (or deleting
+  the file) signs you off immediately. Silence is the off switch.
+- `<your-agent-id>` should be stable for the task, e.g.
+  `side-chat:<chat-id>` or `subagent:<purpose>-<short>`.
 
 ## Messaging the user
 

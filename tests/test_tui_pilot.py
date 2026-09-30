@@ -163,6 +163,36 @@ async def test_sidebar_toggle(fake_home):
 
 
 @pytest.mark.asyncio
+async def test_late_worker_thread_calls_are_dropped_after_shutdown(fake_home):
+    """Regression: a worker thread that outlives app shutdown (e.g. the 5s
+    sleeper in test_running_card_and_realtime_status finishing after its
+    test's app closed) must not schedule onto the dead loop — Textual
+    orphans the callback coroutine, surfacing as 'coroutine ... was never
+    awaited' (RuntimeWarning) in whatever test runs next."""
+    from textual.app import App as _TextualApp
+    from muse_cli.app import MuseCliApp
+    app = MuseCliApp(session="main")
+    calls = []
+    orig = _TextualApp.call_from_thread
+
+    def spy(self, callback, *args, **kwargs):
+        calls.append(getattr(callback, "__name__", callback))
+        return None
+
+    _TextualApp.call_from_thread = spy
+    try:
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.pause(0.2)
+            n0 = len(calls)
+        # App is shut down now: late worker-thread calls are dropped.
+        app._safe_call(app._refresh_statusbar)
+        app.notify("late toast")
+        assert len(calls) == n0, calls
+    finally:
+        _TextualApp.call_from_thread = orig
+
+
+@pytest.mark.asyncio
 async def test_clear_wipes_history_and_restart_stays_clear(fake_home):
     """Regression: /clear must wipe the persisted feed state (session
     JSONL + message/reply files), not just the on-screen cards — otherwise

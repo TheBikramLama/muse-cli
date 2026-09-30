@@ -50,6 +50,11 @@ WATCHER_STALE_S = 300
 # Remote control: any Muse chat can drop {"op": ...} JSON here and the TUI
 # picks it up (~1s). Session-tagged, local-only.
 TUI_CMD_DIR = os.path.join(MUSE_HOME, "tui-cmd")
+# Agent activity reports (muse_cli.activity): agents heartbeat
+# ~/.muse/activity/<agent-id>.json with what they're working on; the TUI
+# surfaces live agents in the activity line and sidebar. Stale files are
+# simply not shown — silence is the off switch.
+ACTIVITY_DIR = os.path.join(MUSE_HOME, "activity")
 # Agent-pushed realtime status: the Muse-side agent writes human-readable
 # progress lines to STATUS_DIR/<task_id>.txt while a task runs; the TUI
 # surfaces the latest line on the task card live. See PROTOCOL.md.
@@ -66,7 +71,7 @@ PAIRED_PATH = os.path.join(MUSE_HOME, "paired.json")
 ALL_DIRS = [QUEUE_DIR, RESULTS_DIR, SESSIONS_DIR, SKILLS_DIR, SCRIPTS_DIR,
             CANCEL_DIR, APPROVAL_DIR, EXPORTS_DIR,
             MESSAGES_DIR, REPLIES_DIR, TODOS_DIR, TUI_CMD_DIR, STATUS_DIR,
-            PAIRING_DIR]
+            PAIRING_DIR, ACTIVITY_DIR]
 
 
 def ensure_dirs() -> None:

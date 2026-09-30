@@ -1,42 +1,73 @@
-"""System-managed todo lists for bridge tasks — maximum visibility.
+"""System-managed todo lists — the mission-control checklist.
 
-The bridge auto-creates ``~/.muse/todos/_auto_<rid>.md`` when a task starts
-(from its ``steps``, or a single item for a plain command), checks items off
-as steps complete, and records the terminal state. Agents update the same
-file for finer-grained progress (see PROTOCOL.md) — it is the user's
-realtime view of the work.
+The bridge auto-creates ``~/.muse/todos/_auto_<slug>-<id>.md`` when a task
+starts (from its ``steps``, or a single item for a plain command), checks
+items off as steps complete, and records the terminal state. Agents
+(side-chats, subagents) create and update their own files under the same
+convention — it is the user's realtime view of who is doing what.
 
-Lifecycle rules (kept deliberately simple and truthful):
-- Success: every item checked; the ``4/4`` list lingers until the next task
-  starts, then it is swept. Visibility without unbounded accumulation.
-- Failure / cancellation: items stay exactly as they were (partial progress
-  is honest); the list lingers until ``/todo clear`` — failures deserve
-  attention, not silent cleanup.
-- Crash orphans (no terminal marker, task never finished) are swept at
-  bridge startup so a restart never shows a stale ``2/4``.
-- Parallel tasks each get their own file (``<rid>`` is unique); advancing
-  one never touches another.
-- If the file was deleted (``/todo clear`` or the agent cleaned up), the
-  bridge never resurrects it.
+File layout::
+
+    <!-- auto:rid=<task-id> owner=<owner-id> t0=<epoch> -->
+    # Human-readable task title
+    - [x] Real step label
+    - [ ] Another real step
+
+Lifecycle rules:
+- The sidebar shows the ``# title``, never the filename.
+- Success: every item checked + ``<!-- auto:done=ok -->``; the ``4/4``
+  lingers ~5 minutes, then it is swept. Visibility without accumulation.
+- Cancelled: ``<!-- auto:done=cancelled -->`` — terminal, swept shortly.
+- Failed: partial progress stays honest (no marker). While the owner is
+  alive it keeps its eyesore status; once abandoned it is swept.
+- Abandoned (no update/heartbeat for ``ABANDONED_AFTER_S``): swept
+  automatically — a halted agent or deleted side-chat never leaves a
+  stale list behind. All-checked but unmarked + stale: given the done
+  marker (the agent finished but forgot to say so).
+- Crash orphans are swept at bridge startup via the same rule.
+- Parallel tasks each get their own file; advancing one never touches
+  another. If the file was deleted (``/todo clear`` or the agent cleaned
+  up), nobody resurrects it.
+
+Ownership / heartbeat: the file's mtime is the lease. The bridge touches
+it on every step; agents touch it (or send an activity report naming it)
+at least every few minutes while working. Silence for 30 minutes means
+the task is gone and the list goes with it.
 """
 from __future__ import annotations
 
 import os
 import re
+import time
 
 from .paths import TODOS_DIR, ensure_dirs
 
 AUTO_PREFIX = "_auto_"
 AUTO_SUFFIX = ".md"
 DONE_MARKER = "<!-- auto:done=%s -->"  # %s: ok | failed | cancelled
+META_RE = re.compile(r"<!--\s*auto:rid=(\S+)\s+owner=(\S+)\s+t0=(\S+)\s*-->")
+DONE_RE = re.compile(r"<!--\s*auto:done=(\w+)\s*-->")
+TITLE_RE = re.compile(r"^#\s+(.+?)\s*$")
+
+#: A todo file nobody touched for this long is abandoned and gets swept.
+ABANDONED_AFTER_S = 30 * 60
+#: Completed (done marker) lists linger this long for visibility, then sweep.
+COMPLETED_LINGER_S = 5 * 60
 
 
-def auto_name(rid: str) -> str:
-    return f"{AUTO_PREFIX}{rid}{AUTO_SUFFIX}"
+def slugify(title: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (title or "").lower()).strip("-")
+    slug = re.sub(r"-{2,}", "-", slug)
+    return slug[:28] or "task"
 
 
-def auto_path(rid: str) -> str:
-    return os.path.join(TODOS_DIR, auto_name(rid))
+def _safe_id(rid: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", rid or "")[:12]
+    return safe or "x"
+
+
+def auto_name(rid: str, title: str = "") -> str:
+    return f"{AUTO_PREFIX}{slugify(title)}-{_safe_id(rid)}{AUTO_SUFFIX}"
 
 
 def is_auto(name: str) -> bool:
@@ -47,72 +78,111 @@ def is_auto(name: str) -> bool:
 _ITEM_RE = re.compile(r"^(\s*[-*]\s+)\[( |x|X)\](.*)$")
 
 
-def _read_items(path: str) -> list[tuple[str, bool, str]] | None:
-    """Parse checklist lines as (prefix, checked, rest); None if unreadable."""
+def parse(path: str) -> dict | None:
+    """Parse a todo file. None when missing/unreadable."""
     try:
         with open(path, encoding="utf-8") as f:
-            lines = f.read().splitlines()
+            text = f.read()
+        mtime = os.path.getmtime(path)
     except OSError:
         return None
-    items = []
-    for ln in lines:
-        m = _ITEM_RE.match(ln)
-        if m:
-            items.append((m.group(1), m.group(2).lower() == "x", m.group(3)))
-    return items
+    rid, owner, t0, done = "", "", 0.0, ""
+    m = META_RE.search(text)
+    if m:
+        rid, owner, t0s = m.group(1), m.group(2), m.group(3)
+        try:
+            t0 = float(t0s)
+        except ValueError:
+            t0 = 0.0
+    dm = DONE_RE.search(text)
+    if dm:
+        done = dm.group(1)
+    title = ""
+    items: list[tuple[str, bool, str]] = []
+    for ln in text.splitlines():
+        if not title:
+            tm = TITLE_RE.match(ln)
+            if tm:
+                title = tm.group(1)
+                continue
+        im = _ITEM_RE.match(ln)
+        if im:
+            items.append((im.group(1), im.group(2).lower() == "x",
+                          im.group(3)))
+    return {"rid": rid, "owner": owner, "t0": t0, "done_marker": done,
+            "title": title, "items": items, "mtime": mtime, "text": text}
 
 
-def _write_items(path: str, items: list[tuple[str, bool, str]],
-                 header: list[str]) -> None:
+def _iter_auto() -> list[tuple[str, str]]:
+    try:
+        names = os.listdir(TODOS_DIR)
+    except OSError:
+        return []
+    return [(n, os.path.join(TODOS_DIR, n)) for n in names if is_auto(n)]
+
+
+def find_path(rid: str) -> str | None:
+    """Locate a task's file by its rid marker (names carry only a slug)."""
+    for _, path in _iter_auto():
+        info = parse(path)
+        if info and info["rid"] == rid:
+            return path
+    return None
+
+
+def create(rid: str, title: str, steps: list[str], owner: str) -> str:
+    """Create the auto todo list for a task; sweep older completed ones.
+
+    Returns the file path — the bridge keeps it for advance/finish.
+    """
+    ensure_dirs()
+    title = (title or rid).strip() or rid
+    owner = (owner or "unknown").strip() or "unknown"
+    items = steps if steps else [title]
+    header = [f"<!-- auto:rid={rid} owner={owner} t0={time.time():.0f} -->",
+              f"# {title}"]
+    path = os.path.join(TODOS_DIR, auto_name(rid, title))
     lines = list(header)
-    for prefix, checked, rest in items:
-        lines.append(f"{prefix}[{'x' if checked else ' '}]{rest}")
+    for s in items:
+        lines.append(f"- [ ] {s}")
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
     except OSError:
         pass
+    sweep_completed()
+    return path
 
 
-def _has_marker(path: str) -> bool:
+def touch(path: str) -> None:
+    """Heartbeat: mark the file as still owned."""
     try:
-        with open(path, encoding="utf-8") as f:
-            return "<!-- auto:done=" in f.read()
+        os.utime(path, None)
     except OSError:
-        return False
+        pass
 
 
-def create(rid: str, title: str, steps: list[str]) -> None:
-    """Create the auto todo list for a task; sweep older completed ones."""
-    ensure_dirs()
-    title = (title or rid).strip() or rid
-    items = steps if steps else [title]
-    header = [f"# {title}", f"<!-- auto:rid={rid} -->"]
-    _write_items(auto_path(rid),
-                 [("- ", False, f" {s}") for s in items], header)
-    sweep_completed(except_rid=rid)
-
-
-def advance(rid: str, done: int) -> None:
-    """Check the first ``done`` items. Never resurrects a deleted file and
-    never unchecks or renames anything the agent wrote."""
-    path = auto_path(rid)
-    try:
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
-    except OSError:
+def advance(path: str, done: int) -> None:
+    """Check the first ``done`` items. Never resurrects a deleted file,
+    never unchecks anything (manual TUI toggles survive)."""
+    info = parse(path)
+    if info is None:
         return  # deleted by /todo clear or the agent — stay deleted
-    lines = text.splitlines()
     seen = 0
     out = []
-    for ln in lines:
+    changed = False
+    for ln in info["text"].splitlines():
         m = _ITEM_RE.match(ln)
-        if m and seen < done:
+        if m and seen < done and m.group(2) == " ":
             seen += 1
+            changed = True
             out.append(f"{m.group(1)}[x]{m.group(3)}")
         else:
+            if m:
+                seen += 1
             out.append(ln)
-    if seen == 0:
+    if not changed:
+        touch(path)  # still alive — refresh the lease
         return
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -121,28 +191,55 @@ def advance(rid: str, done: int) -> None:
         pass
 
 
-def finish(rid: str, ok: bool, note: str = "") -> None:
-    """Record the terminal state. Success checks everything off; failure or
-    cancellation leaves partial progress exactly as it was. Both get a
-    marker so startup can tell them apart from crash orphans."""
-    path = auto_path(rid)
-    items = _read_items(path)
-    if items is None:
-        return
-    marker = DONE_MARKER % ("ok" if ok else ("cancelled" if note == "cancelled"
-                                            else "failed"))
+def toggle_item(path: str, index: int) -> bool | None:
+    """Flip item ``index``; returns the new checked state (None: no file)."""
+    info = parse(path)
+    if info is None:
+        return None
+    out = []
+    cur = 0
+    new_state: bool | None = None
+    for ln in info["text"].splitlines():
+        m = _ITEM_RE.match(ln)
+        if m and cur == index:
+            new_state = m.group(2) == " "
+            out.append(f"{m.group(1)}[{'x' if new_state else ' '}]{m.group(3)}")
+        else:
+            out.append(ln)
+        if m:
+            cur += 1
+    if new_state is None:
+        return None
     try:
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
     except OSError:
+        return None
+    return new_state
+
+
+def finish(path: str, ok: bool, note: str = "") -> None:
+    """Record the terminal state.
+
+    - ok: check everything, ``done=ok`` marker (lingers, then swept).
+    - cancelled: ``done=cancelled`` marker — terminal, swept shortly.
+    - failed: partial progress stays exactly as it was, no marker; the
+      abandonment sweeper clears it once the owner goes quiet.
+    """
+    info = parse(path)
+    if info is None:
         return
-    lines = text.splitlines()
+    lines = info["text"].splitlines()
     if ok:
         lines = [(_ITEM_RE.sub(lambda m: f"{m.group(1)}[x]{m.group(3)}", ln)
                   if _ITEM_RE.match(ln) else ln) for ln in lines]
-    if note and not ok:
-        lines.append(f"> {note[:120]}")
-    lines.append(marker)
+        lines.append(DONE_MARKER % "ok")
+    elif note == "cancelled":
+        lines.append(f"> cancelled")
+        lines.append(DONE_MARKER % "cancelled")
+    else:
+        if note:
+            lines.append(f"> {note[:120]}")
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -150,44 +247,72 @@ def finish(rid: str, ok: bool, note: str = "") -> None:
         pass
 
 
-def sweep_completed(except_rid: str | None = None) -> None:
-    """Delete fully-checked auto lists (their 4/4 had its moment). Failed or
-    partial lists are kept — they need attention, use /todo clear."""
-    try:
-        names = os.listdir(TODOS_DIR)
-    except OSError:
+def mark_done(path: str, state: str = "ok") -> None:
+    """Agent contract: call when the task is done (or just delete the file)."""
+    info = parse(path)
+    if info is None or info["done_marker"]:
         return
-    for name in names:
-        if not is_auto(name):
-            continue
-        if except_rid and name == auto_name(except_rid):
-            continue
-        items = _read_items(os.path.join(TODOS_DIR, name))
-        if items and all(c for _, c, _ in items):
-            try:
-                os.remove(os.path.join(TODOS_DIR, name))
-            except OSError:
-                pass
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(DONE_MARKER % state + "\n")
+    except OSError:
+        pass
 
 
-def sweep_orphans() -> None:
-    """At bridge startup: drop auto lists from tasks that died without a
-    terminal marker. Marked (finished) lists linger truthfully."""
-    try:
-        names = os.listdir(TODOS_DIR)
-    except OSError:
-        return
-    for name in names:
-        if not is_auto(name):
+def sweep_completed() -> int:
+    """Delete done-marker lists whose visibility moment has passed."""
+    now = time.time()
+    n = 0
+    for _, path in _iter_auto():
+        info = parse(path)
+        if info is None or not info["done_marker"]:
             continue
-        path = os.path.join(TODOS_DIR, name)
-        if _has_marker(path):
-            continue
-        items = _read_items(path)
-        if items is None:
-            continue
-        if any(not c for _, c, _ in items):
+        if now - info["mtime"] > COMPLETED_LINGER_S:
             try:
                 os.remove(path)
+                n += 1
             except OSError:
                 pass
+    return n
+
+
+def sweep_abandoned(now: float | None = None,
+                   live_rids: set | None = None) -> dict:
+    """Drop lists nobody is holding any more.
+
+    - stale + incomplete + no done marker → deleted (halted agent,
+      deleted side-chat, crashed task).
+    - stale + all checked + no marker → given the done marker (the agent
+      finished but forgot to say so; it then lingers briefly).
+    - live_rids: request ids currently running in this process — never
+      swept, even if their file went quiet mid-command.
+    Returns {"deleted": [...], "completed": [...]} (filenames).
+    """
+    now = now if now is not None else time.time()
+    live = live_rids or set()
+    deleted, completed = [], []
+    for name, path in _iter_auto():
+        info = parse(path)
+        if info is None or info["done_marker"]:
+            continue
+        if info["rid"] in live:
+            continue
+        if now - info["mtime"] < ABANDONED_AFTER_S:
+            continue
+        items = info["items"]
+        if items and all(c for _, c, _ in items):
+            mark_done(path)
+            completed.append(name)
+        else:
+            try:
+                os.remove(path)
+                deleted.append(name)
+            except OSError:
+                pass
+    return {"deleted": deleted, "completed": completed}
+
+
+def sweep_orphans() -> dict:
+    """Bridge startup: same abandonment rule — a restart never shows a
+    stale list, and a live task (fresh mtime) is never touched."""
+    return sweep_abandoned()

@@ -199,11 +199,20 @@ then keep the link alive:
 5. Todos (maximum visibility): the CLI renders ~/.muse/todos/*.md live in
    its sidebar — update them as you go, don't just report at the end.
    When your bridge request runs, the bridge auto-creates
-   ~/.muse/todos/_auto_<task_id>.md from its steps and checks items off;
-   for finer-grained progress rewrite that same file yourself, flipping
-   "- [ ]" to "- [x]". For conversational work with no bridge request,
-   keep your own ~/.muse/todos/<name>.md. Never leave a stale 2/4 —
-   check everything off when you finish. Full protocol: PROTOCOL.md.
+   ~/.muse/todos/_auto_<slug>-<id>.md from its steps and checks items
+   off; for finer-grained progress rewrite that same file yourself,
+   flipping "- [ ]" to "- [x]". For conversational work with no bridge
+   request, keep your own _auto_ file (marker line first, then a real
+   "# Title", then real step labels — never "step 1"). Touch it every few
+   minutes while live; append <!-- auto:done=ok --> (or delete it) when
+   finished. Never leave a stale 2/4.
+
+6. Be visible while you work: the bridge only sees terminal commands,
+   so heartbeat your non-terminal work with
+   `muse-cli report --agent <id> --task "..." --status "..."`
+   (re-run as it changes; it also heartbeats your todo file). The TUI
+   shows you live in its activity line and agents panel. Full protocol:
+   PROTOCOL.md.
 
 Keep replies short. Never invent bridge results; report what the files
 actually say."""
