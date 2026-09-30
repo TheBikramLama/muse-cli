@@ -878,6 +878,9 @@ class MuseCliApp(App):
         self._agent_data: dict[str, dict] = {}
         self._agent_expanded: str | None = None
         self._agents_key: object = None
+        # Agents already nudged about waiting on the user (one nudge per
+        # waiting episode; the id is dropped when the state leaves waiting).
+        self._waiting_notified: set[str] = set()
         # Watcher visibility: last ~/.muse/watcher.json payload (None = never
         # seen) plus outgoing message cards by mid for status updates.
         self._watcher: dict | None = None
@@ -1265,6 +1268,23 @@ class MuseCliApp(App):
                     auto_todo.touch(p)
         if self._agent_expanded not in self._agent_data:
             self._agent_expanded = None
+        # One-time nudge per waiting episode: an agent that just started
+        # waiting on the user gets a feed card + toast. The id leaves the
+        # notified set when its state changes, so a later waiting episode
+        # nudges again.
+        for aid, rec in self._agent_data.items():
+            if rec.get("display_state") == "waiting":
+                if aid not in self._waiting_notified:
+                    self._waiting_notified.add(aid)
+                    label = (rec.get("label") or aid)[:32]
+                    reason = (rec.get("reason") or "").strip()[:120]
+                    self._safe_call(self._nudge_waiting, label, reason)
+                    self.notify(
+                        f"{label} is waiting on you"
+                        + (f": {reason}" if reason else ""),
+                        title="agent waiting", severity="warning")
+            else:
+                self._waiting_notified.discard(aid)
 
     def _live_agents(self) -> list[tuple[str, dict]]:
         """Agents worth showing, freshest first."""
@@ -1464,26 +1484,44 @@ class MuseCliApp(App):
             pass
         self._refresh_activity()
 
+    # Sidebar agent row icon + color per lifecycle state.
+    _AGENT_STATE_ICON = {
+        "working": ("●", "green"),
+        "waiting": ("◉", "yellow"),
+        "stalled": ("◌", "red"),
+        "done": ("✓", "dim"),
+        "failed": ("✗", "red"),
+    }
+
     def _render_agents(self, side) -> None:
         agents = self._live_agents()
         if not agents:
             return
         side.mount(Static("⚡ agents", classes="todo-side-head"))
         for aid, rec in agents:
-            live = rec.get("live")
+            ds = rec.get("display_state") or "working"
+            icon, color = self._AGENT_STATE_ICON.get(ds, ("●", "green"))
             sec = Vertical(classes="todo-sec")
             side.mount(sec)
             head = AgentHead(aid)
             t = Text()
-            t.append("● " if live else "◐ ",
-                     style="green" if live else "dim")
-            t.append((rec.get("label") or aid)[:22])
+            t.append(icon + " ", style=color)
+            dim_label = ds == "done" or (ds == "working"
+                                         and not rec.get("live"))
+            t.append((rec.get("label") or aid)[:22],
+                     style="dim" if dim_label else "")
             el = rec.get("elapsed", 0)
             t.append(f" · {el / 60:.0f}m" if el >= 60 else f" · {el:.0f}s",
                      style="dim")
+            if ds != "working":
+                t.append(f" · {ds}", style="dim")
             head.update(t)
             sec.mount(head)
             if aid == self._agent_expanded:
+                if rec.get("reason"):
+                    why = "waiting on you: " if ds == "waiting" else ""
+                    sec.mount(Static(f"  ! {why}{rec['reason']}",
+                                     classes="todo-item"))
                 if rec.get("task"):
                     sec.mount(Static(f"  {rec['task']}", classes="todo-item"))
                 if rec.get("status"):
@@ -1496,6 +1534,19 @@ class MuseCliApp(App):
                         f"  ☑ {td['done']}/{td['total']} "
                         f"{(td.get('title') or todo)[:24]}",
                         classes="todo-item"))
+
+    def _nudge_waiting(self, label: str, reason: str) -> None:
+        """Feed card + toast: an agent just started waiting on the user."""
+        t = Text()
+        t.append("⚡ ", style="yellow")
+        t.append(label, style="bold yellow")
+        t.append(" is waiting on you", style="yellow")
+        if reason:
+            t.append(f" — {reason}", style="dim")
+        try:
+            self.task_list.mount(Static(t, classes="msg-card incoming"))
+        except Exception:
+            pass
 
     def _render_todos(self, side) -> None:
         if not self._todo_data:
@@ -2742,26 +2793,42 @@ class MuseCliApp(App):
             t.append(f"◷ {waiting} awaiting approval — a approve · d deny",
                      style="yellow")
         else:
-            live_agents = [a for a in self._live_agents() if a[1].get("live")]
-            if live_agents:
-                aid, rec = live_agents[0]
-                el = rec.get("elapsed", 0)
-                t.append("⚡ ", style="yellow")
-                t.append((rec.get("label") or aid)[:24], style="yellow")
-                status = (rec.get("status") or rec.get("task") or "")[:40]
-                if status:
+            waiting_agents = [a for a in self._live_agents()
+                              if a[1].get("display_state") == "waiting"]
+            if waiting_agents:
+                aid, rec = waiting_agents[0]
+                t.append("◉ ", style="yellow")
+                t.append(f"{(rec.get('label') or aid)[:24]} is waiting on you",
+                         style="yellow")
+                reason = (rec.get("reason") or "")[:48]
+                if reason:
                     t.append(" · ", style="dim")
-                    t.append(status, style="dim")
-                t.append(f" · {el / 60:.0f}m" if el >= 60 else f" · {el:.0f}s",
-                         style="dim")
-                if len(live_agents) > 1:
-                    t.append(f" · +{len(live_agents) - 1} more", style="dim")
+                    t.append(reason, style="dim")
+                if len(waiting_agents) > 1:
+                    t.append(f" · +{len(waiting_agents) - 1} more", style="dim")
             else:
-                ext = self._external_activity_text()
-                if ext is not None:
-                    t = ext
+                live_agents = [a for a in self._live_agents()
+                               if a[1].get("live")]
+                if live_agents:
+                    aid, rec = live_agents[0]
+                    el = rec.get("elapsed", 0)
+                    t.append("⚡ ", style="yellow")
+                    t.append((rec.get("label") or aid)[:24], style="yellow")
+                    status = (rec.get("status") or rec.get("task") or "")[:40]
+                    if status:
+                        t.append(" · ", style="dim")
+                        t.append(status, style="dim")
+                    t.append(f" · {el / 60:.0f}m" if el >= 60
+                             else f" · {el:.0f}s", style="dim")
+                    if len(live_agents) > 1:
+                        t.append(f" · +{len(live_agents) - 1} more",
+                                 style="dim")
                 else:
-                    t.append("○ Idle", style="dim")
+                    ext = self._external_activity_text()
+                    if ext is not None:
+                        t = ext
+                    else:
+                        t.append("○ Idle", style="dim")
         try:
             self.activity_left.update(t)
             # Mini todo summary on the right, above the message box.

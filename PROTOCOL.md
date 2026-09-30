@@ -121,21 +121,31 @@ none of it reaches the TUI unless you say something. Say something:
 
 ```bash
 muse-cli report --agent <your-agent-id> --task "Fixing dashboard drag" \
-  --status "editing DashboardPage.tsx" --todo _auto_<slug>-<id>.md
+  --status "editing DashboardPage.tsx" --todo _auto_<slug>-<id>.md \
+  --state working --label "dashboard drag bugs"
 ```
 
 (or drop the same JSON at `~/.muse/activity/<agent-id>.json` yourself:
 `{"agent": ..., "label": ..., "task": ..., "status": ..., "todo": ...,
-"t0": <epoch>, "at": <epoch>}`).
+"state": "working", "reason": "", "t0": <epoch>, "at": <epoch>}`).
 
 - Re-run it as your status changes (at least every couple of minutes).
   Fresh reports (< 2 min) render live in the activity line and the
   ⚡ agents sidebar panel, with elapsed time.
+- `--state` is your lifecycle: `working` (actively working), `waiting`
+  (blocked on the user — say why with `--reason`; the TUI nudges the
+  user once per waiting episode), `stalled`, `done`, `failed`. Report it
+  honestly; the sidebar shows each state with its own icon and color.
 - `--todo` heartbeats your checklist (see above).
-- Going quiet for 15 minutes drops you from the UI; `--done` (or deleting
-  the file) signs you off immediately. Silence is the off switch.
+- Going quiet for 15 minutes drops you from the UI. A `working` agent
+  quiet for 5+ minutes is auto-flagged **stalled**. Silence is the off
+  switch — but `--done` is the polite one: it marks you finished and you
+  stay visible as done for ~5 minutes. Deleting the file signs you off
+  immediately instead.
 - `<your-agent-id>` should be stable for the task, e.g.
-  `side-chat:<chat-id>` or `subagent:<purpose>-<short>`.
+  `side-chat:<chat-id>` or `subagent:<purpose>-<short>`. `--label` is
+  your display name — use your side-chat's title so the sidebar reads
+  like the chat list, not a UUID.
 
 ## Messaging the user
 

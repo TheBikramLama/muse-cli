@@ -16,7 +16,7 @@ def main() -> None:
     # --task "..." --status "..."` drops ~/.muse/activity/<id>.json so the
     # TUI shows live agent presence (see muse_cli/activity.py).
     if len(sys.argv) > 1 and sys.argv[1] == "report":
-        from .activity import clear, report
+        from .activity import mark_done, report
         rp = argparse.ArgumentParser(
             prog="muse-cli report",
             description="Heartbeat agent activity to the TUI dashboard.")
@@ -27,15 +27,23 @@ def main() -> None:
                         help="what you are doing right now")
         rp.add_argument("--todo", default="",
                         help="your todo filename under ~/.muse/todos/")
-        rp.add_argument("--label", default="", help="short display label")
+        rp.add_argument("--label", default="",
+                        help="display name, e.g. your side-chat's title")
+        rp.add_argument("--state", default="", choices=("working", "waiting",
+                        "stalled", "done", "failed"),
+                        help="lifecycle state; 'waiting' means blocked on "
+                             "the user (say why with --reason)")
+        rp.add_argument("--reason", default="",
+                        help="why waiting/stalled/failed/done")
         rp.add_argument("--done", action="store_true",
-                        help="remove this agent's report")
+                        help="mark finished: stays visible as done ~5 min")
         rargs = rp.parse_args(sys.argv[2:])
         if rargs.done:
-            clear(rargs.agent)
+            print(mark_done(rargs.agent, reason=rargs.reason))
         else:
             print(report(rargs.agent, task=rargs.task, status=rargs.status,
-                         todo=rargs.todo, label=rargs.label))
+                         todo=rargs.todo, label=rargs.label,
+                         state=rargs.state, reason=rargs.reason))
         return
     # Subcommands: `muse-cli setup`, `muse-cli doctor`, `muse-cli pair`,
     # `muse-cli unpair`.

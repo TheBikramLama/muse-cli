@@ -75,3 +75,85 @@ def test_clear_removes_report(act_home):
 def test_todo_basename_stored(act_home):
     activity.report("a1", task="t", todo="/tmp/_auto_x.md")
     assert _load(act_home, "a1")["todo"] == "_auto_x.md"
+
+
+def test_state_and_reason_persist(act_home):
+    activity.report("a1", task="t", state="waiting", reason="need approval")
+    rec = _load(act_home, "a1")
+    assert rec["state"] == "waiting"
+    assert rec["reason"] == "need approval"
+
+
+def test_invalid_state_ignored(act_home):
+    activity.report("a1", task="t", state="napping")
+    assert "state" not in _load(act_home, "a1")
+
+
+def _backdate(act_home, aid, minutes):
+    p = os.path.join(str(act_home), activity._safe_agent(aid) + ".json")
+    with open(p) as f:
+        rec = json.load(f)
+    rec["at"] = time.time() - minutes * 60
+    with open(p, "w") as f:
+        json.dump(rec, f)
+
+
+def test_display_state_passthrough(act_home):
+    activity.report("w", task="t", state="waiting", reason="r")
+    activity.report("f", task="t", state="failed", reason="boom")
+    out = activity.read_all()
+    assert out["w"]["display_state"] == "waiting"
+    assert out["f"]["display_state"] == "failed"
+
+
+def test_working_quiet_not_yet_stalled(act_home):
+    activity.report("q", task="t", state="working")
+    _backdate(act_home, "q", 3)
+    out = activity.read_all()
+    assert out["q"]["display_state"] == "working"
+    assert out["q"]["live"] is False
+
+
+def test_working_quiet_auto_stalled(act_home):
+    activity.report("s", task="t", state="working")
+    _backdate(act_home, "s", 6)
+    out = activity.read_all()
+    assert out["s"]["display_state"] == "stalled"
+
+
+def test_stateless_quiet_auto_stalled(act_home):
+    activity.report("s2", task="t")
+    _backdate(act_home, "s2", 6)
+    out = activity.read_all()
+    assert out["s2"]["display_state"] == "stalled"
+
+
+def test_done_lingers_then_drops(act_home):
+    activity.report("d", task="t")
+    activity.mark_done("d")
+    _backdate(act_home, "d", 4)
+    out = activity.read_all()
+    assert out["d"]["display_state"] == "done"
+    _backdate(act_home, "d", 6)
+    assert "d" not in activity.read_all()
+
+
+def test_mark_done_refreshes_at_and_keeps_fields(act_home):
+    activity.report("d2", task="Fix thing", label="my chat", state="working")
+    _backdate(act_home, "d2", 10)
+    activity.mark_done("d2", reason="shipped")
+    rec = _load(act_home, "d2")
+    assert rec["state"] == "done"
+    assert rec["reason"] == "shipped"
+    assert rec["task"] == "Fix thing"
+    assert rec["label"] == "my chat"
+    assert time.time() - rec["at"] < 60
+
+
+def test_report_without_state_does_not_resurrect_done(act_home):
+    activity.report("d3", task="t")
+    activity.mark_done("d3")
+    activity.report("d3", status="still here")
+    rec = _load(act_home, "d3")
+    assert rec["state"] == "done"
+    assert rec["status"] == "still here"

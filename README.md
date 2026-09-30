@@ -190,7 +190,7 @@ Bridge tasks auto-create `_auto_<slug>-<id>.md` (human `# title` shown in the si
 
 ## Agent presence (mission control)
 
-The bridge only sees terminal commands. Agents heartbeat everything else with `muse-cli report --agent <id> --task "..." --status "..." [--todo <file>]` — the TUI shows live agents in the activity line (`⚡ label · status · 4m`) and a `⚡ agents` sidebar panel with elapsed time; click a row for task detail and checklist progress. Reporting also heartbeats the named todo file. Quiet for 15 minutes = dropped from the UI. See `PROTOCOL.md` for the full agent contract.
+The bridge only sees terminal commands. Agents heartbeat everything else with `muse-cli report --agent <id> --task "..." --status "..." [--todo <file>] [--state working|waiting|stalled|done|failed] [--reason "..."]` — the TUI shows live agents in the activity line (`⚡ label · status · 4m`) and a `⚡ agents` sidebar panel with elapsed time; click a row for task detail and checklist progress. Reporting also heartbeats the named todo file. Lifecycle states render with their own icon/color: `●` working, `◉` waiting on you (nudges the feed once + takes over the activity line), `◌` stalled (auto-flagged after 5 quiet minutes), `✓` done (lingers ~5 min after `--done`), `✗` failed. Set `--label` to your side-chat's title so the sidebar reads like the chat list. Quiet for 15 minutes = dropped from the UI. See `PROTOCOL.md` for the full agent contract.
 
 ## Auto-approve
 
