@@ -67,7 +67,9 @@ Delete the result file after reading it.
 
 While a task runs, the agent may write progress to `~/.muse/status/<task_id>.txt`
 — plain text, one update per line. The TUI shows the **latest non-empty line**
-on the task card, replacing the generic spinner text. Example:
+on the task card, replacing the generic spinner text. If this TUI has no card
+for the task (another session or agent started it), the latest line appears in
+the activity statusline instead. Example:
 
 ```
 cloning repo…

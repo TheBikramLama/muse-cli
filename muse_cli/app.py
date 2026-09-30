@@ -33,12 +33,13 @@ from textual.screen import Screen
 from textual.widgets import (Footer, Input, Label, ListItem, ListView,
                               Markdown, Static, TextArea)
 
-from .bridge import Bridge
+from .bridge import CLAIM_SUFFIX, Bridge
 from .config import load_settings, save_settings
 from . import pairing
+from .instance import pid_alive
 from .pairing_screen import PairingScreen
-from .paths import (DEFAULT_SESSION, EXPORTS_DIR, INPUT_HISTORY_PATH,
-                   MESSAGES_DIR, PAUSED_PATH, REPLIES_DIR, SCRIPTS_DIR,
+from .paths import (APPROVAL_DIR, DEFAULT_SESSION, EXPORTS_DIR, INPUT_HISTORY_PATH,
+                   MESSAGES_DIR, PAUSED_PATH, QUEUE_DIR, REPLIES_DIR, SCRIPTS_DIR,
                    SEEN_PATH, SESSIONS_DIR, SETTINGS_PATH, STATUS_DIR,
                    TODOS_DIR, TUI_CMD_DIR, WATCHER_JSON, WATCHER_STALE_S,
                    ensure_dirs, valid_session)
@@ -151,8 +152,9 @@ def complete_token(text: str, cursor: int, history: list[str], cwd: str,
         elif name == "cd":
             cands = _path_candidates(token, cwd)
         elif name == "todo":
-            cands = [(t[:-3] if t.endswith(".md") else t)
-                     for t in todos if t.startswith(token)]
+            names = ["clear"] + [(t[:-3] if t.endswith(".md") else t)
+                                 for t in todos]
+            cands = [t for t in names if t.startswith(token)]
         elif name == "session":
             cands = [s for s in sessions if s.startswith(token)]
         elif name == "skill" and arg_i == 1:
@@ -192,6 +194,7 @@ Slash commands:
   /skill show <name>              read a skill's SKILL.md
   /todos         show your todo lists in the sidebar
   /todo <name>   expand a todo list in the sidebar
+  /todo clear [name]  delete one todo list, or all of them
   /sidebar       toggle the todo sidebar (works on narrow terminals too)
   /heartbeat <m> ping Muse for updates every m minutes (/heartbeat off)
   /autoapprove [on|off]  toggle auto-approval of approval requests
@@ -201,7 +204,7 @@ Slash commands:
                  (the history bucket — not the instance. Parallel
                  windows use ./run.sh --session <name>.)
   /export [name]  save this session's finished tasks as markdown
-  /clear         clear the screen
+  /clear         clear the screen and wipe its history
   /restart       restart the TUI (picks up new code)
   /help          this help
   /quit          exit
@@ -591,8 +594,12 @@ class CmdInput(Input):
             elif key == "down":
                 app.completion_move(1)
             elif key == "enter":
-                if not app.completion_accept():
+                # A fully typed, valid /command submits on Enter — the
+                # auto-opened dropdown must not rewrite it (e.g. into a
+                # history entry). Partial tokens still accept via Enter.
+                if not app.completion_enter_accepts():
                     return
+                app.completion_accept()
             else:
                 return
             event.prevent_default()
@@ -1382,6 +1389,35 @@ class MuseCliApp(App):
             self._todo_expanded = name
             self._refresh_sidebar()
 
+    def _clear_todos(self, name: str) -> None:
+        """Delete todo list file(s): `/todo clear <name>` removes one list,
+        bare `/todo clear` removes them all. Reads the directory directly
+        (not the poll cache) so just-written lists are covered too."""
+        try:
+            files = [f for f in os.listdir(TODOS_DIR) if f.endswith(".md")]
+        except OSError:
+            files = []
+        if name:
+            key = name if name.endswith(".md") else name + ".md"
+            if key not in files:
+                self.notify(f"no todo list: {name} (see /todos)")
+                return
+            targets = [key]
+        else:
+            targets = sorted(files)
+        n = 0
+        for key in targets:
+            try:
+                os.remove(os.path.join(TODOS_DIR, key))
+                n += 1
+            except OSError:
+                pass
+            self._todo_data.pop(key, None)
+        if self._todo_expanded in targets:
+            self._todo_expanded = None
+        self._refresh_sidebar()
+        self.notify(f"cleared {n} todo list(s)" if n else "no todo lists")
+
     def cycle_todo(self, delta: int) -> None:
         """Keyboard: [ / ] moves the expanded list."""
         names = sorted(self._todo_data)
@@ -1521,6 +1557,48 @@ class MuseCliApp(App):
         if items:
             self._save_seen()
 
+    def _wipe_feed_history(self) -> int:
+        """Delete the persisted state behind the feed so /clear survives
+        a restart: all session JSONL files (task history restores from
+        every bucket) and this window's message/reply files (the startup
+        filter only shows this instance session's). Returns the number
+        of files removed."""
+        wiped = 0
+        try:
+            names = os.listdir(SESSIONS_DIR)
+        except OSError:
+            names = []
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            try:
+                os.remove(os.path.join(SESSIONS_DIR, name))
+                wiped += 1
+            except OSError:
+                pass
+        for d in (MESSAGES_DIR, REPLIES_DIR):
+            try:
+                names = os.listdir(d)
+            except OSError:
+                continue
+            for name in names:
+                if not name.endswith(".json"):
+                    continue
+                p = os.path.join(d, name)
+                try:
+                    with open(p) as f:
+                        sess = json.load(f).get("session", DEFAULT_SESSION)
+                except (OSError, ValueError):
+                    continue
+                if sess != self.instance_session:
+                    continue
+                try:
+                    os.remove(p)
+                    wiped += 1
+                except OSError:
+                    pass
+        return wiped
+
     # -- input box --
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -1622,6 +1700,23 @@ class MuseCliApp(App):
             self.completion_accept_or_open()
         else:
             self.completion_close()
+        return True
+
+    def completion_enter_accepts(self) -> bool:
+        """Whether Enter should accept the highlighted candidate.
+
+        False when the box holds a complete, valid /command: the user
+        typed something runnable, so Enter submits it instead of letting
+        the auto-opened dropdown rewrite it into e.g. a history entry.
+        """
+        if not self.completion_open or not self._comp_items:
+            return False
+        text = (self.cmd_input.value or "").strip()
+        if text.startswith("/"):
+            words = text[1:].split()
+            name = words[0].lower() if words else ""
+            if "/" + name in SLASH_COMMANDS or name in SLASH_ALIASES:
+                return False
         return True
 
     def completion_accept_or_open(self) -> bool:
@@ -1847,6 +1942,8 @@ class MuseCliApp(App):
             # cards and help output are mounted bare (not tracked in
             # self.cards / self._msg_cards), so walk the DOM instead of
             # the tracking dicts. The empty-state widget stays put.
+            # The persisted feed state (session history, message/reply
+            # files) is wiped too, so a restart stays clear.
             n = 0
             keep = getattr(self, "empty_state", None)
             for child in list(self.task_list.children):
@@ -1860,11 +1957,12 @@ class MuseCliApp(App):
             self.cards.clear()
             self._msg_cards.clear()
             self.focused_rid = None
+            wiped = self._wipe_feed_history()
             try:
                 self._refresh_statusbar()
             except Exception:
                 pass
-            self.notify(f"Cleared {n} card(s)")
+            self.notify(f"Cleared {n} card(s), wiped {wiped} history file(s)")
         elif name == "help":
             self.task_list.mount(Static(HELP_TEXT, classes="help-card"))
             self.task_list.scroll_end(animate=False)
@@ -1908,6 +2006,8 @@ class MuseCliApp(App):
         elif name == "todo":
             if not arg:
                 self._toggle_todos()
+            elif arg == "clear" or arg.startswith("clear "):
+                self._clear_todos(arg[6:].strip())
             else:
                 key = arg if arg.endswith(".md") else arg + ".md"
                 rec = self._todo_data.get(key)
@@ -2472,7 +2572,11 @@ class MuseCliApp(App):
             t.append(f"◷ {waiting} awaiting approval — a approve · d deny",
                      style="yellow")
         else:
-            t.append("○ Idle", style="dim")
+            ext = self._external_activity_text()
+            if ext is not None:
+                t = ext
+            else:
+                t.append("○ Idle", style="dim")
         try:
             self.activity_left.update(t)
             # Mini todo summary on the right, above the message box.
@@ -2481,6 +2585,102 @@ class MuseCliApp(App):
                 Text(f"☑ {done}/{total} todos", style="dim") if total else "")
         except AttributeError:
             pass
+
+    def _external_activity_text(self) -> Text | None:
+        """Activity this TUI didn't start: other sessions' tasks, the queue,
+        parked approvals, and the inbox watcher. None when truly nothing is
+        happening — only then does the line read Idle."""
+        own = {c.rid for c in self.cards.values()}
+        # 1. approvals parked by any bridge instance need a human now.
+        try:
+            approvals = [f[:-5] for f in os.listdir(APPROVAL_DIR)
+                         if f.endswith(".json") and f[:-5] not in own]
+        except OSError:
+            approvals = []
+        if approvals:
+            n = len(approvals)
+            return Text(f"◷ {n} awaiting approval — a approve · d deny",
+                        style="yellow")
+        # 2. tasks currently owned by a live bridge instance (any session):
+        # claimed queue files exist exactly while the task runs.
+        live: list[tuple[str, str]] = []  # (rid, claim path)
+        queued = 0
+        try:
+            qnames = os.listdir(QUEUE_DIR)
+        except OSError:
+            qnames = []
+        for name in qnames:
+            base, sep, pid_s = name.rpartition(CLAIM_SUFFIX + ".")
+            if sep and base.endswith(".json") and pid_s.isdigit():
+                rid = base[:-5]
+                if rid in own:
+                    continue
+                try:
+                    alive = pid_alive(int(pid_s))
+                except Exception:
+                    alive = False
+                if alive:
+                    live.append((rid, os.path.join(QUEUE_DIR, name)))
+            elif name.endswith(".json"):
+                queued += 1
+        # 3. agent-pushed status lines for tasks we have no card for.
+        status: list[tuple[float, str, str]] = []  # (mtime, rid, last line)
+        try:
+            sfiles = os.listdir(STATUS_DIR)
+        except OSError:
+            sfiles = []
+        for f in sfiles:
+            if not f.endswith(".txt") or f[:-4] in own:
+                continue
+            p = os.path.join(STATUS_DIR, f)
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    lines = [ln.strip() for ln in fh if ln.strip()]
+                mt = os.path.getmtime(p)
+            except OSError:
+                continue
+            if lines:
+                status.append((mt, f[:-4], lines[-1]))
+        if live or status:
+            t = Text()
+            t.append(SPINNER[self._frame % len(SPINNER)] + " ", style="yellow")
+            n = len({rid for rid, _ in live} |
+                    {rid for _, rid, _ in status})
+            t.append(f"Working · {n} task{'s' if n != 1 else ''}",
+                     style="yellow")
+            desc = ""
+            if status:
+                status.sort()
+                desc = status[-1][2]
+            else:
+                for rid, path in live:
+                    try:
+                        with open(path, encoding="utf-8") as fh:
+                            req = json.load(fh)
+                        cand = req.get("task") or " ".join(
+                            req.get("cmd", []))
+                        if cand:
+                            desc = cand
+                            break
+                    except (OSError, ValueError):
+                        continue
+            if desc:
+                t.append(" · ", style="dim")
+                t.append(desc[:52], style="dim")
+            return t
+        # 4. queued work waiting for a bridge.
+        if queued:
+            return Text(f"◷ {queued} queued", style="dim")
+        # 5. the inbox watcher is composing a reply right now.
+        w = self._watcher
+        if isinstance(w, dict) and w.get("state") == "writing":
+            try:
+                age = time.time() - float(w.get("at") or 0)
+            except (TypeError, ValueError):
+                age = float("inf")
+            if age <= WATCHER_STALE_S:
+                return Text("✎ Muse is writing…", style="yellow")
+        return None
 
     def _refresh_cwdline(self) -> None:
         # Compact: folder • branch ● (green = clean, orange = dirty).

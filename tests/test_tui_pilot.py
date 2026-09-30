@@ -31,10 +31,13 @@ def fake_home(tmp_path, monkeypatch):
         "CANCEL_DIR": str(home / ".muse" / "cancel"),
         "APPROVAL_DIR": str(home / ".muse" / "approval"),
         "TODOS_DIR": str(home / ".muse" / "todos"),
+        "MESSAGES_DIR": str(home / ".muse" / "messages"),
+        "REPLIES_DIR": str(home / ".muse" / "replies"),
         "PAIRING_DIR": str(home / ".muse" / "pairing"),
         "PAIRING_REQUEST_PATH": str(home / ".muse" / "pairing" / "request.json"),
         "PAIRING_RECEIPT_PATH": str(home / ".muse" / "pairing" / "receipt.json"),
         "PAIRED_PATH": str(home / ".muse" / "paired.json"),
+        "INPUT_HISTORY_PATH": str(home / ".muse" / "input_history"),
         "ALL_DIRS": [str(home / ".muse" / d) for d in dirs],
     }
     # Every muse_cli submodule binds path names directly at import;
@@ -160,6 +163,106 @@ async def test_sidebar_toggle(fake_home):
 
 
 @pytest.mark.asyncio
+async def test_clear_wipes_history_and_restart_stays_clear(fake_home):
+    """Regression: /clear must wipe the persisted feed state (session
+    JSONL + message/reply files), not just the on-screen cards — otherwise
+    a restart brings everything back."""
+    import json
+    from muse_cli import pairing as _pairing
+    from muse_cli.app import MuseCliApp
+    from muse_cli.sessions import log
+
+    # Pair (idempotent) in case an earlier test unpaired.
+    _ident = _pairing.ensure_identity()
+    _req = _pairing.ensure_request(_ident["cli_id"])
+    with open(paths.PAIRING_RECEIPT_PATH, "w") as f:
+        json.dump({"code": _req["code"], "nonce": _req["nonce"],
+                   "muse": "pilot", "at": 1}, f)
+    assert _pairing.check_receipt() is not None
+
+    # Seed persisted history: one finished task, one message, one reply.
+    log("20260930-120000", {"type": "task", "id": "t1", "task": "Old task",
+                            "source": "local", "cmd": ["echo", "hi"],
+                            "cwd": "/tmp", "ok": True, "exit": 0,
+                            "duration_s": 0.1, "summary": "ok"})
+    with open(os.path.join(paths.MESSAGES_DIR, "m1.json"), "w") as f:
+        json.dump({"id": "m1", "from": "tui", "text": "hello muse",
+                   "at": 1, "session": "main"}, f)
+    with open(os.path.join(paths.REPLIES_DIR, "m1.json"), "w") as f:
+        json.dump({"id": "m1", "from": "muse", "text": "hello back",
+                   "at": 2, "session": "main"}, f)
+
+    app = MuseCliApp(session="main")
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause(0.5)
+        assert app.query("TaskCard"), "seeded task should restore on boot"
+        assert app.query("MessageCard"), "seeded messages should restore"
+        # Drive /clear through the real input box.
+        cmd = app.query_one("#cmd")
+        cmd.focus()
+        cmd.value = "/clear"
+        await pilot.press("enter")
+        await pilot.pause(0.5)
+        assert not list(app.query("TaskCard")), "task cards should be gone"
+        assert not list(app.query("MessageCard")), "msg cards should be gone"
+        assert os.listdir(paths.SESSIONS_DIR) == [], "session files wiped"
+        assert os.listdir(paths.MESSAGES_DIR) == [], "messages wiped"
+        assert os.listdir(paths.REPLIES_DIR) == [], "replies wiped"
+    # A fresh launch must stay clear — the reported bug.
+    app2 = MuseCliApp(session="main")
+    async with app2.run_test(size=(120, 36)) as pilot2:
+        await pilot2.pause(0.5)
+        assert not list(app2.query("TaskCard")), "no task cards after restart"
+        assert not list(app2.query("MessageCard")), "no msg cards after restart"
+
+
+@pytest.mark.asyncio
+async def test_todo_clear(fake_home):
+    """/todo clear <name> deletes one list; bare /todo clear deletes all."""
+    import json
+    from muse_cli import pairing as _pairing
+    from muse_cli.app import MuseCliApp
+
+    _ident = _pairing.ensure_identity()
+    _req = _pairing.ensure_request(_ident["cli_id"])
+    with open(paths.PAIRING_RECEIPT_PATH, "w") as f:
+        json.dump({"code": _req["code"], "nonce": _req["nonce"],
+                   "muse": "pilot", "at": 1}, f)
+    assert _pairing.check_receipt() is not None
+
+    for name in ("alpha.md", "beta.md"):
+        with open(os.path.join(paths.TODOS_DIR, name), "w") as f:
+            f.write(f"# {name}\n- [x] done thing\n- [ ] todo thing\n")
+    app = MuseCliApp(session="main")
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause(1.5)  # the 1s todo poll picks the files up
+        assert set(app._todo_data) == {"alpha.md", "beta.md"}
+        done, total = app._todo_counts()
+        assert (done, total) == (2, 4)
+
+        async def run_slash(text):
+            cmd = app.query_one("#cmd")
+            cmd.focus()
+            cmd.value = text
+            await pilot.press("enter")
+            await pilot.pause(0.5)
+
+        await run_slash("/todo clear alpha")
+        assert not os.path.exists(os.path.join(paths.TODOS_DIR, "alpha.md"))
+        assert os.path.exists(os.path.join(paths.TODOS_DIR, "beta.md"))
+        assert set(app._todo_data) == {"beta.md"}
+        assert app._todo_counts() == (1, 2)
+
+        await run_slash("/todo clear nosuch")
+        assert os.path.exists(os.path.join(paths.TODOS_DIR, "beta.md"))
+
+        await run_slash("/todo clear")
+        assert os.listdir(paths.TODOS_DIR) == []
+        assert app._todo_data == {}
+        assert app._todo_counts() == (0, 0)
+
+
+@pytest.mark.asyncio
 async def test_pairing_screen_flow(fake_home):
     """Unpaired launch shows the pairing screen; a valid receipt dismisses it."""
     import json
@@ -185,3 +288,69 @@ async def test_pairing_screen_flow(fake_home):
         assert pairing.is_paired()
         # Main UI is usable underneath.
         assert app.query_one("#topline")
+
+
+@pytest.mark.asyncio
+async def test_activity_reflects_external_work(fake_home):
+    """The statusline is not Idle when other agents' work is in flight.
+
+    Covers: live claimed queue files, agent-pushed status lines, queued
+    (unclaimed) files, parked approvals, and the watcher's writing state.
+    """
+    import json
+    import time
+    from muse_cli.app import MuseCliApp
+    from muse_cli.bridge import CLAIM_SUFFIX
+    app = MuseCliApp(session="main")
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause(0.5)
+        assert app._external_activity_text() is None  # truly idle
+
+        # A queued request waiting for a bridge.
+        with open(os.path.join(paths.QUEUE_DIR, "q1.json"), "w") as f:
+            json.dump({"id": "q1", "task": "queued job"}, f)
+        t = app._external_activity_text()
+        assert t is not None and "1 queued" in t.plain, t.plain
+
+        # Claimed by a live pid (this test process) = actively working.
+        os.rename(os.path.join(paths.QUEUE_DIR, "q1.json"),
+                  os.path.join(paths.QUEUE_DIR,
+                               f"q1.json{CLAIM_SUFFIX}.{os.getpid()}"))
+        t = app._external_activity_text()
+        assert t is not None and "Working" in t.plain, t.plain
+
+        # An agent-pushed status line surfaces as the live description.
+        with open(os.path.join(paths.STATUS_DIR, "ext1.txt"), "w") as f:
+            f.write("migrating the database\n")
+        t = app._external_activity_text()
+        assert t is not None and "migrating the database" in t.plain, t.plain
+
+        # Parked approvals outrank working.
+        with open(os.path.join(paths.APPROVAL_DIR, "a1.json"), "w") as f:
+            json.dump({"id": "a1"}, f)
+        t = app._external_activity_text()
+        assert t is not None and "awaiting approval" in t.plain, t.plain
+        os.remove(os.path.join(paths.APPROVAL_DIR, "a1.json"))
+
+        # Stale claims (dead pid) are ignored, not shown as working.
+        os.rename(os.path.join(paths.QUEUE_DIR,
+                               f"q1.json{CLAIM_SUFFIX}.{os.getpid()}"),
+                  os.path.join(paths.QUEUE_DIR,
+                               f"q1.json{CLAIM_SUFFIX}.999999999"))
+        os.remove(os.path.join(paths.STATUS_DIR, "ext1.txt"))
+        with open(os.path.join(paths.QUEUE_DIR, "q2.json"), "w") as f:
+            json.dump({"id": "q2"}, f)
+        t = app._external_activity_text()
+        assert t is not None and "1 queued" in t.plain, t.plain
+        os.remove(os.path.join(paths.QUEUE_DIR,
+                               f"q1.json{CLAIM_SUFFIX}.999999999"))
+        os.remove(os.path.join(paths.QUEUE_DIR, "q2.json"))
+
+        # The watcher composing a reply shows instead of Idle.
+        app._watcher = {"state": "writing", "at": time.time(), "ok": True}
+        t = app._external_activity_text()
+        assert t is not None and "writing" in t.plain, t.plain
+        # ... but a stale heartbeat does not.
+        app._watcher = {"state": "writing", "at": time.time() - 3600,
+                        "ok": True}
+        assert app._external_activity_text() is None
