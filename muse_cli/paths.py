@@ -55,10 +55,18 @@ TUI_CMD_DIR = os.path.join(MUSE_HOME, "tui-cmd")
 # surfaces the latest line on the task card live. See PROTOCOL.md.
 STATUS_DIR = os.path.join(MUSE_HOME, "status")
 IDENTITY_PATH = os.path.join(MUSE_HOME, "cli-identity.json")
+# Pairing handshake (muse_cli.pairing): the CLI writes request.json
+# (code + nonce); the Muse app proves bridge access by echoing the nonce
+# in receipt.json. A completed pairing is recorded in PAIRED_PATH.
+PAIRING_DIR = os.path.join(MUSE_HOME, "pairing")
+PAIRING_REQUEST_PATH = os.path.join(PAIRING_DIR, "request.json")
+PAIRING_RECEIPT_PATH = os.path.join(PAIRING_DIR, "receipt.json")
+PAIRED_PATH = os.path.join(MUSE_HOME, "paired.json")
 
 ALL_DIRS = [QUEUE_DIR, RESULTS_DIR, SESSIONS_DIR, SKILLS_DIR, SCRIPTS_DIR,
             CANCEL_DIR, APPROVAL_DIR, EXPORTS_DIR,
-            MESSAGES_DIR, REPLIES_DIR, TODOS_DIR, TUI_CMD_DIR, STATUS_DIR]
+            MESSAGES_DIR, REPLIES_DIR, TODOS_DIR, TUI_CMD_DIR, STATUS_DIR,
+            PAIRING_DIR]
 
 
 def ensure_dirs() -> None:

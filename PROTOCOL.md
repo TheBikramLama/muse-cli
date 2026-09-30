@@ -16,7 +16,9 @@ All writes should be atomic (write temp file, then rename).
 | `~/.muse/cancel/` | Touch `<task_id>` (empty file) to cancel a running/queued task |
 | `~/.muse/approval/` | Requests with `needs_approval: true` wait here for the user (`a`/`d`) |
 | `~/.muse/watcher.json` | **Heartbeat:** the assistant side writes `{"at": <epoch>, "ok": true, "state": "idle"\|"writing", "mid": <id>\|null, "error": null}` every run. The TUI renders the `CLI ↔ Muse` link from its freshness (stale > 300s) |
-| `~/.muse/cli-identity.json` | CLI identity + pairing code (written by `muse-cli setup`) |
+| `~/.muse/cli-identity.json` | CLI identity: stable machine id (written by `muse-cli setup`) |
+| `~/.muse/paired.json` | Pairing record: which Muse app completed the handshake |
+| `~/.muse/pairing/` | Live handshake: `request.json` (code + nonce), `receipt.json` (nonce echo) |
 | `~/.muse/todos/` | Todo lists the sidebar renders |
 | `~/.muse/sessions/` | Persisted session history |
 | `~/.muse/tui-cmd/` | Remote-control ops for the TUI (`{"op": ...}`, session-tagged) |
@@ -119,11 +121,19 @@ the TUI.
 ## Pairing a new machine
 
 1. User installs: `curl -fsSL https://raw.githubusercontent.com/TheBikramLama/muse-cli/main/install.sh | bash`
-2. User runs `muse-cli setup` → prints a pairing code, e.g. `7K2P-9XQM`.
-3. User tells their assistant: *"Connect to my muse-cli (pairing code 7K2P-9XQM).
-   Protocol: <this file's URL>. Bridge directories: ~/.muse/"*.
-4. The assistant sends `{"ping": true}` via the queue; the pong confirms the link.
-5. The assistant starts its poll loop (queue + messages) and heartbeat writes.
+2. User runs `muse-cli setup` (or just launches `muse-cli`) → the CLI
+   creates `~/.muse/pairing/request.json` holding a human-readable code
+   plus a random nonce, and prints a copyable prompt.
+3. User pastes the prompt into the Muse app. The assistant:
+   - reads `pairing/request.json`, confirms the code,
+   - writes `pairing/receipt.json` echoing the nonce back — this proves
+     it reached *this* machine's bridge,
+   - sets up its ~2-minute poll loop (queue + messages) and heartbeat
+     writes, per the prompt's watcher instructions.
+4. The CLI validates code + nonce, records the pairing in
+   `~/.muse/paired.json`, and deletes the handshake files.
+   `muse-cli doctor` reports the paired state.
 
-The pairing code in `~/.muse/cli-identity.json` lets the assistant confirm it
-reached the right machine: include the code in the first ping's `task` text.
+The nonce echo proves liveness: a stale or copied receipt can't pair.
+`muse-cli unpair` wipes the pairing (and the CLI identity) so the next
+launch re-enters the flow — the equivalent of logging out.

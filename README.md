@@ -30,14 +30,18 @@ Requires Python 3.10+.
 Then pair it with the Muse app:
 
 ```bash
-muse-cli setup     # one-time: creates ~/.muse, prints your pairing code
-muse-cli           # launch the TUI
+muse-cli setup     # one-time: creates ~/.muse, starts pairing
+muse-cli           # launch the TUI (shows the pairing screen if not paired)
+muse-cli pair      # re-run pairing any time
+muse-cli unpair    # reset: next launch asks to connect again
 muse-cli doctor    # check the Muse connection any time
 ```
 
-`muse-cli setup` prints a pairing code — tell your Muse assistant
-*"Connect to my muse-cli (pairing code XXXX-XXXX)"* along with the protocol doc
-below, and it will ping your CLI to confirm the link.
+`muse-cli setup` (or the first TUI launch) shows a pairing code plus a
+copyable prompt — paste it into the Muse app. The assistant proves it can
+reach this machine by echoing a one-time nonce back into
+`~/.muse/pairing/receipt.json`; the CLI validates it and records the
+pairing. The prompt also carries the watcher setup so the link stays alive.
 
 ## Protocol
 
@@ -94,7 +98,9 @@ Guardrails (live-editable in `~/.muse/settings.json`): executable allowlist, all
 ├── replies/        # Muse's replies, rendered as cards
 ├── watcher.json    # inbox-watcher heartbeat (liveness for the TUI)
 ├── status/         # agent-pushed realtime status: <task-id>.txt, latest line shown live
-├── cli-identity.json # CLI identity + pairing code (from `muse-cli setup`)
+├── cli-identity.json # CLI identity (stable machine id, from `muse-cli setup`)
+├── paired.json       # pairing record (from the pairing handshake)
+├── pairing/          # live handshake: request.json (code + nonce), receipt.json
 ├── todos/          # live Markdown checklists from Muse
 ├── sessions/       # JSONL history, one file per app run
 ├── skills/         # your skills (each in <name>/SKILL.md)

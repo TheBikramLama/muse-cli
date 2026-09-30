@@ -35,6 +35,8 @@ from textual.widgets import (Footer, Input, Label, ListItem, ListView,
 
 from .bridge import Bridge
 from .config import load_settings, save_settings
+from . import pairing
+from .pairing_screen import PairingScreen
 from .paths import (DEFAULT_SESSION, EXPORTS_DIR, INPUT_HISTORY_PATH,
                    MESSAGES_DIR, PAUSED_PATH, REPLIES_DIR, SCRIPTS_DIR,
                    SEEN_PATH, SESSIONS_DIR, SETTINGS_PATH, STATUS_DIR,
@@ -199,7 +201,7 @@ Slash commands:
                  (the history bucket — not the instance. Parallel
                  windows use ./run.sh --session <name>.)
   /export [name]  save this session's finished tasks as markdown
-  /clear         remove finished task cards
+  /clear         clear the screen
   /restart       restart the TUI (picks up new code)
   /help          this help
   /quit          exit
@@ -900,6 +902,11 @@ class MuseCliApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        # First run (or after `muse-cli unpair`): connect to the Muse app
+        # before anything else. The screen dismisses itself once the
+        # handshake validates.
+        if not pairing.is_paired():
+            self.push_screen(PairingScreen())
         self._refresh_statusbar()
         # Restore heartbeat timer if it was enabled in settings.
         hb = self.settings.get("heartbeat_minutes", 0)
@@ -1835,21 +1842,23 @@ class MuseCliApp(App):
             else:
                 self.notify(f"no such directory: {arg or '~'}")
         elif name == "clear":
+            # Clear the whole feed: task cards, message/reply cards and
+            # /help output — anything mounted in the task list. Reply
+            # cards and help output are mounted bare (not tracked in
+            # self.cards / self._msg_cards), so walk the DOM instead of
+            # the tracking dicts. The empty-state widget stays put.
             n = 0
-            for rid, card in list(self.cards.items()):
+            keep = getattr(self, "empty_state", None)
+            for child in list(self.task_list.children):
+                if child is keep:
+                    continue
                 try:
-                    card.remove()
+                    child.remove()
                 except Exception:
                     pass
-                del self.cards[rid]
                 n += 1
-            for mid in list(self._msg_cards.keys()):
-                try:
-                    self._msg_cards[mid].remove()
-                except Exception:
-                    pass
-                del self._msg_cards[mid]
-                n += 1
+            self.cards.clear()
+            self._msg_cards.clear()
             self.focused_rid = None
             try:
                 self._refresh_statusbar()

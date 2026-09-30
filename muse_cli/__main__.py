@@ -12,10 +12,13 @@ from .paths import DEFAULT_SESSION
 
 
 def main() -> None:
-    # Subcommands first: `muse-cli setup`, `muse-cli doctor`.
-    if len(sys.argv) > 1 and sys.argv[1] in ("setup", "doctor"):
-        from .setup import cmd_doctor, cmd_setup
-        sys.exit(cmd_setup() if sys.argv[1] == "setup" else cmd_doctor())
+    # Subcommands: `muse-cli setup`, `muse-cli doctor`, `muse-cli pair`,
+    # `muse-cli unpair`.
+    if len(sys.argv) > 1 and sys.argv[1] in ("setup", "doctor", "pair", "unpair"):
+        from .setup import cmd_doctor, cmd_pair, cmd_setup, cmd_unpair
+        cmds = {"setup": cmd_setup, "doctor": cmd_doctor,
+                "pair": cmd_pair, "unpair": cmd_unpair}
+        sys.exit(cmds[sys.argv[1]]())
 
     p = argparse.ArgumentParser(prog="muse-cli", description="Full-screen TUI terminal bridge for Muse.")
     p.add_argument("--daemon", action="store_true",

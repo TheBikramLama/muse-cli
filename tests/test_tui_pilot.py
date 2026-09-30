@@ -31,6 +31,10 @@ def fake_home(tmp_path, monkeypatch):
         "CANCEL_DIR": str(home / ".muse" / "cancel"),
         "APPROVAL_DIR": str(home / ".muse" / "approval"),
         "TODOS_DIR": str(home / ".muse" / "todos"),
+        "PAIRING_DIR": str(home / ".muse" / "pairing"),
+        "PAIRING_REQUEST_PATH": str(home / ".muse" / "pairing" / "request.json"),
+        "PAIRING_RECEIPT_PATH": str(home / ".muse" / "pairing" / "receipt.json"),
+        "PAIRED_PATH": str(home / ".muse" / "paired.json"),
         "ALL_DIRS": [str(home / ".muse" / d) for d in dirs],
     }
     # Every muse_cli submodule binds path names directly at import;
@@ -44,6 +48,15 @@ def fake_home(tmp_path, monkeypatch):
                 monkeypatch.setattr(mod, attr, val, raising=False)
     for d in mapping["ALL_DIRS"]:
         os.makedirs(d, exist_ok=True)
+    # Main-UI tests run as a paired CLI; the pairing flow has its own test.
+    import json
+    from muse_cli import pairing as _pairing
+    _ident = _pairing.ensure_identity()
+    _req = _pairing.ensure_request(_ident["cli_id"])
+    with open(mapping["PAIRING_RECEIPT_PATH"], "w") as f:
+        json.dump({"code": _req["code"], "nonce": _req["nonce"],
+                   "muse": "pilot", "at": 1}, f)
+    assert _pairing.check_receipt() is not None
     return home
 
 
@@ -144,3 +157,31 @@ async def test_sidebar_toggle(fake_home):
             f.write("# Demo\n- [x] done thing\n- [ ] todo thing\n")
         await pilot.pause(1.5)
         _shot(pilot, "07-sidebar")
+
+
+@pytest.mark.asyncio
+async def test_pairing_screen_flow(fake_home):
+    """Unpaired launch shows the pairing screen; a valid receipt dismisses it."""
+    import json
+    from muse_cli import pairing
+    from muse_cli.app import MuseCliApp
+    from muse_cli.pairing_screen import PairingScreen
+    # Undo the fixture's pairing: back to a fresh unpaired state.
+    pairing.unpair()
+    assert not pairing.is_paired()
+    app = MuseCliApp(session="main")
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause(0.5)
+        assert isinstance(app.screen, PairingScreen), type(app.screen)
+        req = pairing.load_request()
+        assert req is not None and req["code"]
+        _shot(pilot, "08-pairing-screen")
+        # The Muse app completes the handshake by writing the receipt.
+        with open(paths.PAIRING_RECEIPT_PATH, "w") as f:
+            json.dump({"code": req["code"], "nonce": req["nonce"],
+                       "muse": "pilot", "at": 1}, f)
+        await pilot.pause(4.0)  # 2s poll interval + 1.5s dismiss delay
+        assert not isinstance(app.screen, PairingScreen), type(app.screen)
+        assert pairing.is_paired()
+        # Main UI is usable underneath.
+        assert app.query_one("#topline")

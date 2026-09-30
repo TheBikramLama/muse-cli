@@ -1,38 +1,34 @@
-"""`muse-cli setup` and `muse-cli doctor`.
+"""`muse-cli setup`, `muse-cli doctor`, `muse-cli pair`, `muse-cli unpair`.
 
-setup:   first-run onboarding. Creates ~/.muse, generates a CLI identity +
-         pairing code, and prints exactly what to tell the Muse app so it can
-         find this CLI. Non-interactive (safe when piped from curl).
-doctor:  connection diagnostics. Reports whether the Muse link is active or
-         inactive, whether the TUI is running, and whether the bridge dirs are
-         healthy. Exit code 0 = all good, 1 = something needs attention.
+setup:   first-run onboarding. Creates ~/.muse, generates a CLI identity,
+         starts a pairing request and prints the copyable prompt for the
+         Muse app. Non-interactive (safe when piped from curl): it only
+         waits for the pairing receipt when stdin is a TTY.
+pair:    interactive pairing — (re)prints the prompt and waits for the
+         Muse app to complete the handshake.
+unpair:  wipe pairing state so the next launch re-enters the flow.
+doctor:  connection diagnostics. Reports pairing state, whether the Muse
+         link is active, whether the TUI is running, and whether the
+         bridge dirs are healthy. Exit 0 = all good, 1 = problems.
 """
 from __future__ import annotations
 
 import json
 import os
-import secrets
 import sys
 import time
-import uuid
 
 from . import __version__
+from . import pairing
 from .paths import (ALL_DIRS, IDENTITY_PATH, MUSE_HOME, SETTINGS_PATH,
                     WATCHER_JSON, WATCHER_STALE_S, ensure_dirs)
-
-_PAIR_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no I/L/O/0/1
-
-
-def _pairing_code() -> str:
-    raw = "".join(secrets.choice(_PAIR_ALPHABET) for _ in range(8))
-    return f"{raw[:4]}-{raw[4:]}"
 
 
 def load_identity() -> dict | None:
     try:
         with open(IDENTITY_PATH, encoding="utf-8") as f:
             ident = json.load(f)
-        if isinstance(ident, dict) and ident.get("pairing_code"):
+        if isinstance(ident, dict) and ident.get("cli_id"):
             return ident
     except (OSError, ValueError):
         pass
@@ -76,24 +72,13 @@ def cmd_setup() -> int:
         return 1
     _ok(f"bridge directories at {MUSE_HOME}")
 
-    # 3. Identity / pairing code (stable: never regenerate silently)
-    ident = load_identity()
-    if ident is None:
-        ident = {
-            "cli_id": uuid.uuid4().hex,
-            "pairing_code": _pairing_code(),
-            "created_at": int(time.time()),
-            "version": __version__,
-        }
-        try:
-            with open(IDENTITY_PATH, "w", encoding="utf-8") as f:
-                json.dump(ident, f, indent=2)
-        except OSError as e:
-            _bad(f"could not write {IDENTITY_PATH}: {e}")
-            return 1
-        _ok("new CLI identity generated")
-    else:
-        _ok("existing CLI identity kept")
+    # 3. Identity (stable: never regenerate silently)
+    try:
+        ident = pairing.ensure_identity()
+    except OSError as e:
+        _bad(f"could not write {IDENTITY_PATH}: {e}")
+        return 1
+    _ok(f"CLI identity ({ident['cli_id'][:8]}…)")
 
     # 4. Settings file exists (TUI bootstraps defaults; just ensure readable)
     if os.path.isfile(SETTINGS_PATH):
@@ -101,24 +86,70 @@ def cmd_setup() -> int:
     else:
         _ok("settings.json will be created on first launch")
 
-    code = ident["pairing_code"]
+    # 5. Pairing with the Muse app
+    if pairing.is_paired():
+        info = pairing.paired_info() or {}
+        _ok(f"paired with {info.get('muse') or 'Muse app'}")
+        print()
+        print("  Already paired — run `muse-cli unpair` to reset and pair again.")
+        print("  Run `muse-cli doctor` any time to check the connection.")
+        return 0
+    req = pairing.ensure_request(ident["cli_id"])
+    _print_pairing_prompt(req)
+    if sys.stdin.isatty():
+        return _wait_for_pairing()
+    print("  Run `muse-cli pair` to complete pairing.")
+    return 0
+
+
+def _print_pairing_prompt(req: dict) -> None:
     print()
-    print(f"  Your pairing code:  {code}")
-    print("  (Keep it private \u2014 it identifies this machine's CLI.)")
+    print(f"  Pairing code:  {req['code']}")
     print()
-    print("  Next steps:")
-    print("    1. Start the CLI:   muse-cli")
-    print("    2. In the Muse app, tell your assistant:")
+    print("  Paste this prompt into the Muse app to connect it:")
+    print("  " + "-" * 42)
+    for line in pairing.build_prompt(req).splitlines():
+        print(line)
+    print("  " + "-" * 42)
+
+
+def _wait_for_pairing() -> int:
     print()
-    print(f'       "Connect to my muse-cli (pairing code {code})."')
-    print('       "Protocol: https://github.com/TheBikramLama/muse-cli/blob/main/PROTOCOL.md"')
-    print(f'       "Bridge directories: {MUSE_HOME}/"')
-    print()
-    print("  Your assistant will send a ping \u2014 you'll see it as a task card.")
-    print("  The status line shows the link state: CLI \u2194 Muse \u25cf connected")
-    print("  (or \u25cb not seen / \u26a0 silent while it sorts itself out).")
-    print()
-    print("  Run `muse-cli doctor` any time to check the connection.")
+    print("  Waiting for the Muse app to complete pairing…")
+    print("  (Ctrl+C to skip — run `muse-cli pair` when you're ready.)")
+    try:
+        while True:
+            time.sleep(2)
+            rec = pairing.check_receipt()
+            if rec is not None:
+                print()
+                _ok(f"paired with {rec.get('muse') or 'Muse app'} ✓")
+                print("  Start the TUI:  muse-cli")
+                return 0
+    except KeyboardInterrupt:
+        print()
+        print("  Skipped — run `muse-cli pair` when you're ready.")
+        return 0
+
+
+def cmd_pair() -> int:
+    """(Re)run the interactive pairing flow."""
+    ident = pairing.ensure_identity()
+    if pairing.is_paired():
+        info = pairing.paired_info() or {}
+        print(f"Already paired with {info.get('muse') or 'Muse app'}.")
+        print("Run `muse-cli unpair` first to pair again.")
+        return 0
+    req = pairing.ensure_request(ident["cli_id"])
+    print(f"muse-cli pair  (v{__version__})")
+    print("=" * 46)
+    _print_pairing_prompt(req)
+    return _wait_for_pairing()
+
+
+def cmd_unpair() -> int:
+    pairing.unpair()
+    print("Unpaired — the next launch will ask to connect the Muse app again.")
     return 0
 
 
@@ -183,9 +214,17 @@ def cmd_doctor() -> int:
     # Identity
     ident = load_identity()
     if ident:
-        _ok(f"CLI identity (pairing code {ident['pairing_code']})")
+        _ok(f"CLI identity ({ident['cli_id'][:8]}…)")
     else:
         _bad(f"no CLI identity  (run `muse-cli setup`)")
+        problems += 1
+
+    # Pairing with the Muse app
+    if pairing.is_paired():
+        info = pairing.paired_info() or {}
+        _ok(f"paired with {info.get('muse') or 'Muse app'}")
+    else:
+        _bad("not paired with the Muse app  (run `muse-cli pair`)")
         problems += 1
 
     # TUI
