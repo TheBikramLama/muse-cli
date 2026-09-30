@@ -2495,7 +2495,7 @@ class MuseCliApp(App):
             t.append(" • ", style="dim")
             t.append(branch, style="dim")
             t.append(" ")
-            t.append("●", style="orange" if dirty else "green")
+            t.append("●", style="dark_orange" if dirty else "green")
         try:
             self.cwdline.update(t)
         except AttributeError:
