@@ -193,3 +193,36 @@ def test_unpair_resets(fake_home, capsys):
     assert "Unpaired" in capsys.readouterr().out
     assert not pairing.is_paired()
     assert setup.load_identity() is None
+
+
+def _write_pid(home, content: str):
+    p = home / ".muse" / "muse-cli.pid"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+
+
+def test_tui_running_json_pid_file(fake_home):
+    # the TUI writes a JSON guard: {"pid": ..., "mode": "tui", ...}
+    _write_pid(fake_home, json.dumps(
+        {"pid": os.getpid(), "mode": "tui", "session": "main"}))
+    assert setup._tui_running() is True
+
+
+def test_tui_running_legacy_plain_pid(fake_home):
+    _write_pid(fake_home, str(os.getpid()))
+    assert setup._tui_running() is True
+
+
+def test_tui_running_stale_pid(fake_home):
+    _write_pid(fake_home, json.dumps({"pid": 2 ** 31 - 1,
+                                      "mode": "tui"}))
+    assert setup._tui_running() is False
+
+
+def test_tui_running_missing_file(fake_home):
+    assert setup._tui_running() is False
+
+
+def test_tui_running_garbage(fake_home):
+    _write_pid(fake_home, "not-json-or-a-pid")
+    assert setup._tui_running() is False

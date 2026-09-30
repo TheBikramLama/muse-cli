@@ -180,9 +180,25 @@ def _tui_running() -> bool:
     pid_path = os.path.join(MUSE_HOME, "muse-cli.pid")
     try:
         with open(pid_path, encoding="utf-8") as f:
-            pid = int(f.read().strip().split()[0])
-    except (OSError, ValueError):
+            raw = f.read().strip()
+    except OSError:
         return False
+    if raw.startswith("{"):
+        # JSON guard written by the TUI: {"pid": 123, "mode": "tui", ...}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return False
+        val = data.get("pid") if isinstance(data, dict) else None
+        if isinstance(val, bool) or not isinstance(val, int):
+            return False
+        pid = val
+    else:
+        # legacy plain-pid format
+        try:
+            pid = int(raw.split()[0])
+        except (ValueError, IndexError):
+            return False
     try:
         os.kill(pid, 0)
     except OSError:
