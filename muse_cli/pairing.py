@@ -196,5 +196,14 @@ then keep the link alive:
 4. Say so in chat once the first heartbeat is written — the CLI is
    watching for your receipt and will show "connected".
 
+5. Todos (maximum visibility): the CLI renders ~/.muse/todos/*.md live in
+   its sidebar — update them as you go, don't just report at the end.
+   When your bridge request runs, the bridge auto-creates
+   ~/.muse/todos/_auto_<task_id>.md from its steps and checks items off;
+   for finer-grained progress rewrite that same file yourself, flipping
+   "- [ ]" to "- [x]". For conversational work with no bridge request,
+   keep your own ~/.muse/todos/<name>.md. Never leave a stale 2/4 —
+   check everything off when you finish. Full protocol: PROTOCOL.md.
+
 Keep replies short. Never invent bridge results; report what the files
 actually say."""

@@ -20,6 +20,7 @@ import threading
 import time
 
 from .config import load_settings
+from . import auto_todo
 from .instance import pid_alive
 from .paths import (APPROVAL_DIR, CANCEL_DIR, DEFAULT_SESSION, PAUSED_PATH,
                     QUEUE_DIR, ensure_dirs)
@@ -86,6 +87,7 @@ class Bridge:
     # -- lifecycle --
     def start(self) -> None:
         self._requeue_stale_claims()
+        auto_todo.sweep_orphans()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="muse-bridge")
         self._thread.start()
 
@@ -94,6 +96,7 @@ class Bridge:
 
     def run_forever(self) -> None:
         self._requeue_stale_claims()
+        auto_todo.sweep_orphans()
         try:
             self._loop()
         except KeyboardInterrupt:
@@ -248,6 +251,20 @@ class Bridge:
 
             _call(self.on_start, req)
 
+            # System-managed todo list: one checklist per task, created from
+            # its steps (or a single item for a plain command). The bridge
+            # advances it per step; agents update the same file for
+            # finer-grained progress (see PROTOCOL.md).
+            raw_steps = req.get("steps")
+            step_names: list[str] = []
+            if isinstance(raw_steps, list):
+                for i, s in enumerate(raw_steps, 1):
+                    if isinstance(s, dict):
+                        step_names.append(s.get("name") or f"step {i}")
+            title = (req.get("task") or " ".join(req.get("cmd", []) or [])
+                     or rid)
+            auto_todo.create(rid, title, step_names)
+
             def _chunk(line: str) -> None:
                 _call(self.on_chunk, rid, line)
 
@@ -256,6 +273,8 @@ class Bridge:
 
             def _step(i: int, n: int, name: str) -> None:
                 _call(self.on_step, rid, i, n, name)
+                # on_step fires when step i *starts*: steps before it are done.
+                auto_todo.advance(rid, i - 1)
 
             try:
                 res = run_steps(req, self.settings, on_chunk=_chunk, on_proc=_got_proc,
@@ -270,6 +289,13 @@ class Bridge:
                 res["error"] = "cancelled"
                 res["summary"] = "cancelled"
                 res["exit"] = None
+            ok = bool(res.get("ok"))
+            note = ""
+            if not ok:
+                note = ("cancelled" if res.get("error") == "cancelled"
+                        else (res.get("summary") or res.get("error")
+                              or "failed"))
+            auto_todo.finish(rid, ok, note)
             if req.get("skills"):
                 res["skills"] = list(req["skills"])
             write_result(res)

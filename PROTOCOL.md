@@ -85,6 +85,27 @@ running test suite (42 tests)…
 This is how the card reflects what the agent is *actually doing* instead of
 a static "Waiting for you".
 
+## Todos — update as you go (maximum visibility)
+
+`~/.muse/todos/*.md` are Markdown checklists rendered live in the TUI's todo
+sidebar and summarized on the statusline (`☑ 2/4 todos`). They are the user's
+realtime view of your progress — **update them as you go**, don't just report
+at the end.
+
+- **Bridge tasks:** when your request starts, the bridge auto-creates
+  `~/.muse/todos/_auto_<task_id>.md` from your request's `steps` (a single
+  item for a plain command) and checks items off as steps complete. For
+  finer-grained progress, rewrite the same file yourself, flipping
+  `- [ ]` to `- [x]` as you finish things. Use the **same `<task_id>`** as
+  your queued request. Never touch another task's `_auto_` file.
+- **Conversational work** (no bridge request): create your own
+  `~/.muse/todos/<short-name>.md` and keep it current.
+- Format: `# Title` on the first line, then `- [ ]` / `- [x]` lines.
+  Parallel agents use separate files — never merge two tasks into one list.
+- When your work finishes, check everything off. Don't leave a stale `2/4`:
+  fully-checked auto lists linger (visible `4/4`) until the next task starts;
+  failed or partial ones stay until the user runs `/todo clear`.
+
 ## Messaging the user
 
 The user types plain text in the TUI input box → `~/.muse/messages/<mid>.json`:

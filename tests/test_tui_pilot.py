@@ -354,3 +354,33 @@ async def test_activity_reflects_external_work(fake_home):
         app._watcher = {"state": "writing", "at": time.time() - 3600,
                         "ok": True}
         assert app._external_activity_text() is None
+
+
+@pytest.mark.asyncio
+async def test_activity_shows_auto_todo_progress(fake_home):
+    """An agent's auto todo checklist progress appears in the Working line."""
+    import json
+    from muse_cli.app import MuseCliApp
+    from muse_cli.bridge import CLAIM_SUFFIX
+    app = MuseCliApp(session="main")
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause(0.5)
+        # Another session's task, claimed by a live pid.
+        with open(os.path.join(paths.QUEUE_DIR, "w1.json"), "w") as f:
+            json.dump({"id": "w1", "task": "widget work"}, f)
+        os.rename(os.path.join(paths.QUEUE_DIR, "w1.json"),
+                  os.path.join(paths.QUEUE_DIR,
+                               f"w1.json{CLAIM_SUFFIX}.{os.getpid()}"))
+        # Its system-managed todo list, 1 of 2 done.
+        with open(os.path.join(paths.TODOS_DIR, "_auto_w1.md"), "w") as f:
+            f.write("# widget work\n- [x] scaffold\n- [ ] tests\n")
+        app._poll_todos()
+        t = app._external_activity_text()
+        assert t is not None and "Working" in t.plain, t.plain
+        assert "1/2" in t.plain, t.plain
+        # A fully-checked list no longer contributes progress.
+        with open(os.path.join(paths.TODOS_DIR, "_auto_w1.md"), "w") as f:
+            f.write("# widget work\n- [x] scaffold\n- [x] tests\n")
+        app._poll_todos()
+        t = app._external_activity_text()
+        assert t is not None and "1/2" not in t.plain, t.plain

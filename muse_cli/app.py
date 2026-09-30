@@ -34,6 +34,7 @@ from textual.widgets import (Footer, Input, Label, ListItem, ListView,
                               Markdown, Static, TextArea)
 
 from .bridge import CLAIM_SUFFIX, Bridge
+from .auto_todo import AUTO_PREFIX
 from .config import load_settings, save_settings
 from . import pairing
 from .instance import pid_alive
@@ -2586,6 +2587,26 @@ class MuseCliApp(App):
         except AttributeError:
             pass
 
+    def _active_auto_todo(self) -> tuple[str, int, int] | None:
+        """Most recently touched incomplete system-managed todo list.
+
+        Returns (name, done, total) or None. Used by the activity line so
+        an agent's checklist progress is visible even without a task card.
+        """
+        try:
+            data = self._todo_data
+        except AttributeError:
+            return None
+        best: tuple[float, str, int, int] | None = None
+        for name, rec in data.items():
+            if not name.startswith(AUTO_PREFIX):
+                continue
+            if rec["done"] >= rec["total"]:
+                continue
+            if best is None or rec["mtime"] > best[0]:
+                best = (rec["mtime"], name, rec["done"], rec["total"])
+        return best[1:] if best else None  # type: ignore[return-value]
+
     def _external_activity_text(self) -> Text | None:
         """Activity this TUI didn't start: other sessions' tasks, the queue,
         parked approvals, and the inbox watcher. None when truly nothing is
@@ -2648,6 +2669,13 @@ class MuseCliApp(App):
                     {rid for _, rid, _ in status})
             t.append(f"Working · {n} task{'s' if n != 1 else ''}",
                      style="yellow")
+            # System-managed todo progress for the active task, if any:
+            # maximum visibility for agents' checklists.
+            auto = self._active_auto_todo()
+            if auto is not None:
+                _aname, done, total = auto
+                t.append(" · ", style="dim")
+                t.append(f"{done}/{total}", style="dim")
             desc = ""
             if status:
                 status.sort()
