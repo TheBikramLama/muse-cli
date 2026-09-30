@@ -414,3 +414,24 @@ async def test_activity_shows_auto_todo_progress(fake_home):
         app._poll_todos()
         t = app._external_activity_text()
         assert t is not None and "1/2" not in t.plain, t.plain
+
+
+@pytest.mark.asyncio
+async def test_update_nag_banner(fake_home):
+    from muse_cli.app import MuseCliApp
+    app = MuseCliApp(session="main")
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause(0.5)
+        banner = app.query_one("#updatebanner")
+        assert app._update_status is None
+        app._on_update_status({"behind": True, "local": "a" * 40,
+                               "remote": "b" * 40, "branch": "main"})
+        await pilot.pause()
+        assert app._update_status is not None
+        assert app._update_status["behind"] is True
+        assert "press u" in str(banner.render())
+        # Back up to date: nag clears.
+        app._on_update_status({"behind": False, "local": "a" * 40,
+                               "remote": "a" * 40, "branch": "main"})
+        await pilot.pause()
+        assert app._update_status is None

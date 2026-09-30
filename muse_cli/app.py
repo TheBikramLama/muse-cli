@@ -38,6 +38,7 @@ from . import activity, auto_todo
 from .auto_todo import AUTO_PREFIX, is_auto as _is_auto_todo
 from .config import load_settings, save_settings
 from . import pairing
+from . import update
 from .instance import pid_alive
 from .pairing_screen import PairingScreen
 from .paths import (APPROVAL_DIR, DEFAULT_SESSION, EXPORTS_DIR, INPUT_HISTORY_PATH,
@@ -58,6 +59,7 @@ SLASH_COMMANDS = [
     "/autoapprove", "/cd", "/clear", "/export", "/heartbeat", "/help",
     "/quit", "/restart", "/run", "/scripts", "/session", "/sessions",
     "/settings", "/sidebar", "/skill", "/skills", "/todo", "/todos",
+    "/update",
 ]
 SKILL_SUBCOMMANDS = ["install", "remove", "show"]
 COMP_MAX = 10
@@ -208,6 +210,7 @@ Slash commands:
   /export [name]  save this session's finished tasks as markdown
   /clear         clear the screen and wipe its history
   /restart       restart the TUI (picks up new code)
+  /update        pull the latest code and restart into it
   /help          this help
   /quit          exit
 
@@ -715,6 +718,8 @@ class MuseCommands(Provider):
          "show or hide a task's commands and full output"),
         ("scroll_bottom", "Scroll to bottom",
          "jump the task list to the newest card"),
+        ("update_restart", "Update & restart",
+         "pull the latest code and restart into it"),
     ]
 
     async def search(self, query: str) -> Hits:
@@ -735,6 +740,12 @@ class MuseCliApp(App):
         height: 1; min-height: 1;
         background: $surface; color: $text;
         padding: 0 1;
+    }
+    #updatebanner {
+        height: 1; min-height: 1;
+        background: $warning; color: $text;
+        padding: 0 1;
+        display: none;
     }
     #modeline {
         height: 1;
@@ -838,6 +849,7 @@ class MuseCliApp(App):
         ("s", "save_output", "Save"),
         ("y", "copy_task", "Copy"),
         ("g", "scroll_bottom", "Bottom"),
+        ("u", "update_restart", "Update"),
     ]
     # ^p command palette: Textual's system commands plus our own provider.
     COMMANDS = App.COMMANDS | {MuseCommands}
@@ -881,6 +893,10 @@ class MuseCliApp(App):
         # Agents already nudged about waiting on the user (one nudge per
         # waiting episode; the id is dropped when the state leaves waiting).
         self._waiting_notified: set[str] = set()
+        # Self-update state: latest update.check() result (None = unknown
+        # or up to date) and whether the nag toast already fired.
+        self._update_status: dict | None = None
+        self._update_notified = False
         # Watcher visibility: last ~/.muse/watcher.json payload (None = never
         # seen) plus outgoing message cards by mid for status updates.
         self._watcher: dict | None = None
@@ -945,6 +961,9 @@ class MuseCliApp(App):
     def compose(self) -> ComposeResult:
         self.topline = Static("", id="topline")
         yield self.topline
+        # Update nag banner: hidden unless this checkout is behind origin.
+        self.update_banner = Static("", id="updatebanner")
+        yield self.update_banner
         self.toasts = Vertical(id="toasts")
         yield self.toasts
         with Horizontal(id="main"):
@@ -1012,6 +1031,14 @@ class MuseCliApp(App):
             self._on_approval(req)
         self._refresh_statusbar()
         self.set_interval(0.1, self._tick)
+        # Self-update nag: poll origin for a newer commit (0 disables).
+        upd_mins = self.settings.get("update_check_minutes", 15)
+        try:
+            upd_mins = float(upd_mins)
+        except (TypeError, ValueError):
+            upd_mins = 15
+        if upd_mins:
+            self.set_interval(upd_mins * 60, self._update_tick)
         self.task_list.scroll_end(animate=False)
         try:
             self.cmd_input.focus()
@@ -2258,6 +2285,8 @@ class MuseCliApp(App):
             self._export_session(arg)
         elif name == "restart":
             self._restart_self()
+        elif name == "update":
+            self.action_update_restart()
         elif name in ("quit", "q"):
             self.exit()
         else:
@@ -2272,6 +2301,63 @@ class MuseCliApp(App):
         os.environ["MUSE_CLI_RESTART"] = "1"
         self.notify("restarting…")
         self.exit()
+
+    # -- self-update nag ------------------------------------------------
+    def _update_tick(self) -> None:
+        """Periodic update check: compare HEAD with origin (worker thread)."""
+        threading.Thread(target=self._update_check_thread,
+                         daemon=True).start()
+
+    def _update_check_thread(self) -> None:
+        try:
+            status = update.check()
+        except Exception:
+            status = None
+        self._safe_call(self._on_update_status, status)
+
+    def _on_update_status(self, status: dict | None) -> None:
+        if not status or not status.get("behind"):
+            self._update_status = None
+            try:
+                self.update_banner.styles.display = "none"
+            except Exception:
+                pass
+            return
+        self._update_status = status
+        try:
+            self.update_banner.update(
+                "⬆ update available "
+                f"({status['branch']} "
+                f"{status['local'][:7]}→{status['remote'][:7]}) — "
+                "press u to update & restart")
+            self.update_banner.styles.display = "block"
+        except Exception:
+            pass
+        if not self._update_notified:
+            self._update_notified = True
+            self.notify("update available — press u to update & restart",
+                        title="muse-cli", severity="warning")
+
+    def action_update_restart(self) -> None:
+        """Pull the latest code and restart into it (u / /update)."""
+        if self._update_status is None:
+            self.notify("checking for updates…")
+            self._update_tick()
+            return
+        self.notify("pulling latest code…")
+        threading.Thread(target=self._update_pull_thread,
+                         daemon=True).start()
+
+    def _update_pull_thread(self) -> None:
+        ok, msg = update.pull()
+        self._safe_call(self._on_update_pulled, ok, msg)
+
+    def _on_update_pulled(self, ok: bool, msg: str) -> None:
+        if not ok:
+            self.notify(f"update failed: {msg[:200]}", severity="error")
+            return
+        self._update_notified = False
+        self._restart_self()
 
     def _export_session(self, arg: str) -> None:
         cards = [c for c in self.task_list.query(TaskCard)

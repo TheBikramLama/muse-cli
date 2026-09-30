@@ -20,6 +20,7 @@ import time
 
 from . import __version__
 from . import pairing
+from . import update
 from .paths import (ALL_DIRS, IDENTITY_PATH, MUSE_HOME, SETTINGS_PATH,
                     WATCHER_JSON, WATCHER_STALE_S, ensure_dirs)
 
@@ -249,6 +250,18 @@ def cmd_doctor() -> int:
     else:
         _bad("TUI not running  (start with: muse-cli)")
         problems += 1
+
+    # Updates: is this checkout behind origin?
+    upd = update.check()
+    if upd is None:
+        print("  \u25cb updates: check unavailable (not a git checkout?)")
+    elif upd["behind"]:
+        _bad(f"update available ({upd['branch']} "
+             f"{upd['local'][:7]}\u2192{upd['remote'][:7]})  "
+             "(press u in the TUI, or: git pull)")
+        problems += 1
+    else:
+        _ok("up to date")
 
     # Muse link
     state, detail = _watcher_state()

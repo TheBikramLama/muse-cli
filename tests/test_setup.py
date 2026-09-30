@@ -6,7 +6,17 @@ import time
 
 import pytest
 
-from muse_cli import pairing, paths, setup
+from muse_cli import pairing, paths, setup, update
+
+
+@pytest.fixture(autouse=True)
+def _stub_update_check(monkeypatch):
+    # update.check() hits the network (git ls-remote) against the real
+    # checkout; stub it so doctor tests stay hermetic and fast.
+    monkeypatch.setattr(
+        update, "check",
+        lambda root=None: {"behind": False, "local": "a" * 40,
+                           "remote": "a" * 40, "branch": "main"})
 
 
 @pytest.fixture
@@ -108,6 +118,21 @@ def test_doctor_after_setup(fake_home, capsys):
     assert "TUI not running" in out
     assert "inactive" in out  # Muse link never seen
     assert "paired with test-muse" in out
+
+
+def test_doctor_update_available_is_a_problem(fake_home, capsys,
+                                               monkeypatch):
+    monkeypatch.setattr(
+        update, "check",
+        lambda root=None: {"behind": True, "local": "a" * 40,
+                           "remote": "b" * 40, "branch": "main"})
+    assert setup.cmd_setup() == 0
+    _pair(fake_home)
+    capsys.readouterr()
+    rc = setup.cmd_doctor()
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "update available" in out
 
 
 def test_doctor_unpaired_is_a_problem(fake_home, capsys):
