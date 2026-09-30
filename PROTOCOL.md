@@ -201,3 +201,60 @@ the TUI.
 The nonce echo proves liveness: a stale or copied receipt can't pair.
 `muse-cli unpair` wipes the pairing (and the CLI identity) so the next
 launch re-enters the flow — the equivalent of logging out.
+
+## `muse-cli exec` (synchronous wrapper)
+
+`muse-cli exec [--cwd DIR] [--timeout SEC] [--session NAME] -- <cmd...>`
+does the queue → poll → read → delete dance in one call, for scripts and
+agents that want a blocking command. (`--` is the documented separator;
+without it the command is taken as-is when unambiguous.)
+
+- Validates `cmd[0]`'s basename against the settings allowlist (the same
+  check `runner.py` runs) and exits `2` on violation — nothing is queued.
+- Queues with `source: "muse-cli-exec"`, default session `"main"`, timeout
+  `min(requested or default_timeout, max_timeout)`.
+- Waits for the bridge to claim the request (the `<id>.json.claimed.<pid>`
+  marker). If nothing claims it within 15s, exits `3` with a "no bridge"
+  hint and leaves the queue file in place.
+- On result: prints stdout/stderr, deletes the result file, exits with the
+  command's exit code (`1` when the result carries none).
+- On timeout: drops a cancel file in `~/.muse/cancel/`, prints the request
+  id so the late result can be picked up from
+  `~/.muse/results/<id>.json`, and exits `124`.
+
+## MCP server (stdio)
+
+`muse_cli/mcp.py` exposes the bridge as an MCP server (`muse-cli mcp`), so
+MCP clients can run terminal commands through the same guardrailed bridge
+the TUI uses. The server never executes anything itself — it validates,
+queues, and waits.
+
+- Transport: JSON-RPC 2.0 over stdio, newline-delimited (one JSON object
+  per line, no Content-Length headers) — the framing the MCP spec defines
+  for its stdio transport.
+- `initialize` returns `protocolVersion`, `capabilities.tools`, and
+  `serverInfo` (`name: "muse-cli"`). `tools/list` and `tools/call` are
+  supported; `notifications/initialized` is tolerated silently. Unknown
+  methods → `-32601`, bad params → `-32602`, unparseable input → `-32700`.
+- Tools:
+  - `terminal_run(cmd, cwd?, timeout?, task?, session?)` — validates
+    `cmd[0]`'s basename against the bridge executable allowlist and `cwd`
+    against the allowed roots (the same checks as `runner.py`; violations
+    are `-32602` errors), queues the request with `source: "mcp"`, and
+    blocks until the result file appears or `timeout` elapses (default
+    from settings, capped by `max_timeout`). Returns `stdout`, `stderr`,
+    `exit`, `timed_out`, `request_id`. If no bridge claims the request
+    within 15s it returns `-32000`: start the TUI (`./run.sh`) or the
+    daemon (`python -m muse_cli --daemon`). The result file is consumed.
+  - `terminal_result(request_id)` — picks up a result that arrived after a
+    `terminal_run` wait timed out; `{ready: false}` when nothing is there.
+    Consumes the result file, like a normal client would.
+  - `terminal_cancel(request_id)` — drops the cancel file in
+    `~/.muse/cancel/`.
+  - `agents_list()` — activity reports with derived `display_state`.
+  - `activity_report(agent, task?, status?, state?, reason?, label?, todo?)`
+    — same lifecycle `state` set as `muse-cli report`.
+  - `todos_list()` / `todos_read(name)` — auto todo checklists: progress
+    summary, then full text and items.
+- The allowlist is never bypassed: the server checks it before queueing,
+  and the bridge checks it again at execution time.

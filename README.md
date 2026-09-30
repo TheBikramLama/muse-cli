@@ -158,6 +158,10 @@ Run several TUIs at once, one per named session:
 
 `p` pauses the bridge (queue held, status bar shows `⏸ paused`); `p` again resumes. `r` retries the selected finished task as a fresh card.
 
+## `muse-cli exec` (synchronous bridge wrapper)
+
+`muse-cli exec [--cwd DIR] [--timeout SEC] [--session NAME] -- <cmd...>` queues one command and waits for the bridge to run it, then prints its stdout/stderr and exits with the command's exit code — no TUI needed. Same guardrails as the bridge: executable must be on the settings allowlist, argv is never a shell string. Exit codes: `2` usage/allowlist rejection, `3` no bridge claimed the request within 15s (start the TUI or `muse-cli --daemon`), `124` timed out (a cancel is written and the request id is printed so you can check `~/.muse/results/<id>.json` later).
+
 ## Background daemon & per-session instances
 
 One bridge (TUI or daemon) runs per session — the first claims its session lock, and a second start of the same session exits instead of double-running the queue. Different sessions run side by side freely.
@@ -212,6 +216,10 @@ Task requests can carry `"skills": ["name", …]`; the card shows a `⚙` badge 
 Plain-text messages only become a conversation if something on the Muse side reads them. A scheduled job (every ~2 minutes) watches `~/.muse/messages/`, treats each new file as your instruction, does the work — via the same `~/.muse/queue/` bridge when it needs your Mac — and writes a Markdown reply to `~/.muse/replies/<id>.json`, which the TUI renders as a card. Each message is answered exactly once (processed IDs are tracked); your outgoing files are kept so the startup history view still works. Replies echo the message's `"session"` tag so they land in the right window.
 
 The watcher also writes a heartbeat to `~/.muse/watcher.json` on every run (`at`, `ok`, `state` = `idle`/`writing`, `mid`, `error`). The TUI reads it for the status-bar watcher segment: `●` fresh, `✎ writing…` while it answers, `⚠ silent Nm` when no heartbeat arrived for over 5 minutes, `⚠ error` on a recorded failure, `○ not seen` before the first run. A dead watcher can't write anything, so a stale heartbeat is itself the down signal — that's how the TUI tells "no reply yet" apart from "nobody's listening".
+
+## MCP server
+
+`muse-cli mcp` runs a stdio MCP server (newline-delimited JSON-RPC 2.0, stdlib only) exposing the bridge as tools: `terminal_run` / `terminal_result` / `terminal_cancel` for commands, plus `agents_list`, `activity_report`, `todos_list`, and `todos_read`. Terminal commands go through the same executable allowlist, cwd roots, and queue protocol as the TUI — point any MCP client (Claude Code, Cursor, …) at it with a stdio transport. See `PROTOCOL.md` for the tool reference.
 
 ## Roadmap ideas
 

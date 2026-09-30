@@ -52,6 +52,15 @@ def main() -> None:
         cmds = {"setup": cmd_setup, "doctor": cmd_doctor,
                 "pair": cmd_pair, "unpair": cmd_unpair}
         sys.exit(cmds[sys.argv[1]]())
+    # `muse-cli mcp`: stdio MCP server (see muse_cli/mcp.py).
+    if len(sys.argv) > 1 and sys.argv[1] == "mcp":
+        from .mcp import mcp_main
+        sys.exit(mcp_main(sys.argv[2:]))
+    # `muse-cli exec -- <cmd...>`: synchronous bridge wrapper
+    # (see muse_cli/exec_cmd.py).
+    if len(sys.argv) > 1 and sys.argv[1] == "exec":
+        from .exec_cmd import exec_main
+        sys.exit(exec_main(sys.argv[2:]))
 
     p = argparse.ArgumentParser(prog="muse-cli", description="Full-screen TUI terminal bridge for Muse.")
     p.add_argument("--daemon", action="store_true",
